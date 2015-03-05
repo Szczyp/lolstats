@@ -3,6 +3,7 @@
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE NoImplicitPrelude          #-}
 {-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE TypeFamilies               #-}
 
 module Main where
@@ -17,12 +18,13 @@ import           Data.Aeson                      (FromJSON, ToJSON, decode)
 import           Data.Aeson.Lens
 import           Data.Text                       (replace)
 import           Network.HTTP.Client             (HttpException (StatusCodeException))
-import           Network.Wreq
+import           Network.Wreq                    hiding (getWith)
+import           Network.Wreq.Session
 import           Text.Show.Pretty
 
-newtype App a = App { unApp :: ReaderT Config (ErrorT AppError IO) a }
-              deriving (Functor, Applicative, Monad
-                       , MonadIO, MonadReader Config, MonadError AppError, MonadBase IO)
+newtype App a = App { unApp :: ReaderT (Session, Config) (ErrorT AppError IO) a }
+              deriving (Functor, Applicative, Monad, MonadIO, MonadReader (Session, Config)
+                       , MonadError AppError, MonadBase IO)
 
 instance MonadBaseControl IO App where
   type StM App a = Either AppError a
@@ -48,7 +50,7 @@ instance ToJSON Config
 txt :: Show a => a -> Text
 txt = pack . show
 
-runApp :: Show a => App a -> Config -> IO (Either AppError a)
+runApp :: Show a => App a -> (Session, Config) -> IO (Either AppError a)
 runApp (App a) = runErrorT . runReaderT a
 
 catchHttp :: IO a -> (HttpException -> Text) -> App a
@@ -57,9 +59,9 @@ catchHttp action handler = liftIO (catch (Right <$> action) (return . Left . han
 
 getData :: Text -> App (Response LByteString)
 getData url = do
-  (Config aUrl aKey) <- ask
+  (sess, (Config aUrl aKey)) <- ask
   let opts = defaults & param "api_key" .~ [aKey]
-  getWith opts (unpack $ aUrl ++ url) `catchHttp` handler
+  getWith opts sess (unpack $ aUrl ++ url) `catchHttp` handler
   where handler (StatusCodeException s _ _) = decodeUtf8 $ s ^. statusMessage
         handler _ = "Network Error"
 
@@ -113,8 +115,8 @@ app = do
   getSummonerId name >>= getCurrentGame "EUN1" >>= putStrLn . pack . ppShow
 
 main :: IO ()
-main = do
+main = withSession $ \sess -> do
   json <- readFile "config.json"
-  let cfg = decode json :: Maybe Config
+  let cfg = (sess,) <$> (decode json :: Maybe Config)
       err = print $ asText "Error: Cannot read config file"
   maybe err (runApp app >=> either print return) cfg
