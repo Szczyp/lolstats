@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE NoImplicitPrelude          #-}
@@ -50,12 +51,15 @@ instance ToJSON Config
 txt :: Show a => a -> Text
 txt = pack . show
 
+throw :: MonadError AppError m => Text -> m a
+throw = throwError . AppError
+
 runApp :: Show a => App a -> (Session, Config) -> IO (Either AppError a)
 runApp (App a) = runErrorT . runReaderT a
 
 catchHttp :: IO a -> (HttpException -> Text) -> App a
 catchHttp action handler = liftIO (catch (Right <$> action) (return . Left . handler))
-                           >>= either (throwError . AppError) return
+                           >>= either throw return
 
 getData :: Text -> App (Response LByteString)
 getData url = do
@@ -67,7 +71,7 @@ getData url = do
 
 getSummonerId :: Text -> App Integer
 getSummonerId name = getId <$> getData url
-                     >>= maybe (throwError (AppError "Can't get summoner id")) return
+                     >>= maybe (throw "Can't get summoner id") return
   where url = "api/lol/eune/v1.4/summoner/by-name/" ++ name
         nameKey = key . toLower . replace " " "" $ name
         getId = (^? responseBody . nameKey . key "id" . _Integer)
@@ -110,13 +114,17 @@ getChampionName championId = getName <$> getData url
 
 app :: App ()
 app = do
-  name <- headMay <$> getArgs
-          >>= maybe (throwError $ AppError "Need summoner name as argument") return
+  name <- headMay <$> getArgs >>= maybe (throw "Need summoner name as argument") return
   getSummonerId name >>= getCurrentGame "EUN1" >>= putStrLn . pack . ppShow
 
+parseConfig :: ErrorT AppError IO Config
+parseConfig = do
+  json <- readFile "config.json" `catchAny` fileError
+  let cfg = decode json :: Maybe Config
+  maybe parseError return cfg
+  where fileError = const $ throw "Cannot find config file"
+        parseError = throw "Cannot parse config file"
+
 main :: IO ()
-main = withSession $ \sess -> do
-  json <- readFile "config.json"
-  let cfg = (sess,) <$> (decode json :: Maybe Config)
-      err = print $ asText "Error: Cannot read config file"
-  maybe err (runApp app >=> either print return) cfg
+main = withSession $ \sess ->
+  runErrorT parseConfig >>= either print ((runApp app >=> either print return) . (sess,))
