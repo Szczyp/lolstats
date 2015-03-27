@@ -79,9 +79,9 @@ getSummonerId name = getId <$> getData url
 getCurrentGame :: Text -> Integer -> App [[(Text, Text, Text)]]
 getCurrentGame region summonerId = do
   participants <- getParticipants <$> getData url
-  ad <- async $ getSummonersDivision . map (\(_, s, _, _) -> s) $ participants
-  champions <- mapConcurrently (getChampionName . (\(_, _, _, c) -> c)) participants
-  divisions <- wait ad
+  (divisions, champions) <- runConcurrently $ (,)
+                            <$> Concurrently (getDivisions participants)
+                            <*> Concurrently (getChampions participants)
   return $ map (map (\(c, n, d, _) -> (c, n, d)))
          $ groupAllOn (\(_, _, _, t) -> t)
          $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
@@ -92,6 +92,8 @@ getCurrentGame region summonerId = do
                                           , o ^?! key "summonerId" . _Integer
                                           , o ^?! key "teamId" . _Integer
                                           , o ^?! key "championId" . _Integer)))
+        getDivisions = getSummonersDivision . map (\(_, s, _, _) -> s)
+        getChampions = mapConcurrently $ getChampionName . (\(_, _, _, c) -> c)
 
 getSummonersDivision :: [Integer] -> App [Text]
 getSummonersDivision summonerIds = do
