@@ -83,7 +83,7 @@ getCurrentGame region summonerId = do
                             <$> Concurrently (getDivisions participants)
                             <*> Concurrently (getChampions participants)
   return $ map (map (\(c, n, d, _) -> (c, n, d)))
-         $ groupAllOn (\(_, _, _, t) -> t)
+         $ groupAllOn (^. _4)
          $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
   where url = "observer-mode/rest/consumer/getSpectatorGameInfo"
               ++ "/" ++ region ++ "/" ++ (txt summonerId)
@@ -92,8 +92,8 @@ getCurrentGame region summonerId = do
                                           , o ^?! key "summonerId" . _Integer
                                           , o ^?! key "teamId" . _Integer
                                           , o ^?! key "championId" . _Integer)))
-        getDivisions = getSummonersDivision . map (\(_, s, _, _) -> s)
-        getChampions = mapConcurrently $ getChampionName . (\(_, _, _, c) -> c)
+        getDivisions = getSummonersDivision . map (^. _2)
+        getChampions = mapConcurrently $ getChampionName . (^. _4)
 
 getSummonersDivision :: [Integer] -> App [Text]
 getSummonersDivision summonerIds = do
@@ -102,7 +102,7 @@ getSummonersDivision summonerIds = do
   where sids = intercalate "," . map txt $ summonerIds
         url = "api/lol/eune/v2.5/league/by-summoner/" ++ sids ++ "/entry"
         getRankedSolo5x5 = maybe "Unranked" (\(_, t, d) -> t ++ " " ++ d)
-                           . headMay . filter (\(q, _, _) -> q == "RANKED_SOLO_5x5")
+                           . headMay . filter ((== "RANKED_SOLO_5x5") . (^. _1))
         getDivision json sid = (json ^.. responseBody . key (txt sid) . values
                                 . to (\o -> ( o ^?! key "queue" . _String
                                             , o ^?! key "tier" . _String
