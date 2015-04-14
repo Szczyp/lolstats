@@ -4,7 +4,6 @@
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE NoImplicitPrelude          #-}
 {-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE TypeFamilies               #-}
 
 module Main where
@@ -23,13 +22,14 @@ import           Network.Wreq                    hiding (getWith)
 import           Network.Wreq.Session
 import           Text.Show.Pretty
 
-newtype App a = App { unApp :: ReaderT (Session, Config) (ErrorT AppError IO) a }
-              deriving (Functor, Applicative, Monad, MonadIO, MonadReader (Session, Config)
+newtype App a = App (ReaderT Config (ErrorT AppError IO) a)
+              deriving (Functor, Applicative, Monad, MonadIO, MonadReader Config
                        , MonadError AppError, MonadBase IO)
 
 instance MonadBaseControl IO App where
   type StM App a = Either AppError a
   liftBaseWith f = App $ liftBaseWith $ \run -> f (run . unApp)
+    where unApp (App a) = a
   restoreM = App . restoreM
 
 newtype AppError = AppError Text
@@ -40,13 +40,16 @@ instance Show AppError where
 instance Error AppError where
   strMsg = AppError . pack
 
-data Config = Config { apiUrl :: Text
-                     , apiKey :: Text
-                     }
-            deriving (Show, Generic)
+data ApiConfig = ApiConfig { apiUrl :: Text
+                           , apiKey :: Text
+                           } deriving (Show, Generic)
+instance FromJSON ApiConfig
 
-instance FromJSON Config
-instance ToJSON Config
+data Config = Config { cApi     :: ApiConfig
+                     , cSession :: Session
+                     , cRegion  :: Text
+                     , cName    :: Text
+                     } deriving (Show)
 
 txt :: Show a => a -> Text
 txt = pack . show
@@ -54,7 +57,7 @@ txt = pack . show
 throw :: MonadError AppError m => Text -> m a
 throw = throwError . AppError
 
-runApp :: Show a => App a -> (Session, Config) -> IO (Either AppError a)
+runApp :: Show a => App a -> Config -> IO (Either AppError a)
 runApp (App a) = runErrorT . runReaderT a
 
 catchHttp :: IO a -> (HttpException -> Text) -> App a
@@ -63,21 +66,25 @@ catchHttp action handler = liftIO (catch (Right <$> action) (return . Left . han
 
 getData :: Text -> App (Response LByteString)
 getData url = do
-  (sess, (Config aUrl aKey)) <- ask
+  (sess, (ApiConfig aUrl aKey)) <- (cSession &&& cApi) <$> ask
   let opts = defaults & param "api_key" .~ [aKey]
   getWith opts sess (unpack $ aUrl ++ url) `catchHttp` handler
   where handler (StatusCodeException s _ _) = decodeUtf8 $ s ^. statusMessage
         handler _ = "Network Error"
 
-getSummonerId :: Text -> App Integer
-getSummonerId name = getId <$> getData url
-                     >>= maybe (throw "Can't get summoner id") return
-  where url = "api/lol/eune/v1.4/summoner/by-name/" ++ name
-        nameKey = key . toLower . replace " " "" $ name
-        getId = (^? responseBody . nameKey . key "id" . _Integer)
+getSummonerId :: App Integer
+getSummonerId = do
+  (name, region) <- (cName &&& cRegion) <$> ask
+  let url = "api/lol/" ++ toLower region ++ "/v1.4/summoner/by-name/" ++ name
+      nameKey = key . toLower . replace " " "" $ name
+      getId = (^? responseBody . nameKey . key "id" . _Integer)
+  getId <$> getData url >>= maybe (throw "Can't get summoner id") return
 
-getCurrentGame :: Text -> Integer -> App [[(Text, Text, Text)]]
-getCurrentGame region summonerId = do
+getCurrentGame :: Integer -> App [[(Text, Text, Text)]]
+getCurrentGame summonerId = do
+  region <- toUpper . take 3 . cRegion <$> ask
+  let url = "observer-mode/rest/consumer/getSpectatorGameInfo"
+            ++ "/" ++ region ++ "1/" ++ (txt summonerId)
   participants <- getParticipants <$> getData url
   (divisions, champions) <- runConcurrently $ (,)
                             <$> Concurrently (getDivisions participants)
@@ -85,22 +92,21 @@ getCurrentGame region summonerId = do
   return $ map (map (\(c, n, d, _) -> (c, n, d)))
          $ groupAllOn (^. _4)
          $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
-  where url = "observer-mode/rest/consumer/getSpectatorGameInfo"
-              ++ "/" ++ region ++ "/" ++ (txt summonerId)
-        getParticipants = (^.. responseBody . key "participants" . values
-                              . to (\o -> ( o ^?! key "summonerName" . _String
-                                          , o ^?! key "summonerId" . _Integer
-                                          , o ^?! key "teamId" . _Integer
-                                          , o ^?! key "championId" . _Integer)))
+  where getParticipants = (^.. responseBody . key "participants" . values
+                           . to (\o -> ( o ^?! key "summonerName" . _String
+                                       , o ^?! key "summonerId" . _Integer
+                                       , o ^?! key "teamId" . _Integer
+                                       , o ^?! key "championId" . _Integer)))
         getDivisions = getSummonersDivision . map (^. _2)
         getChampions = mapConcurrently $ getChampionName . (^. _4)
 
 getSummonersDivision :: [Integer] -> App [Text]
 getSummonersDivision summonerIds = do
+  region <- cRegion <$> ask
+  let url = "api/lol/" ++ toLower region ++ "/v2.5/league/by-summoner/" ++ sids ++ "/entry"
   r <- getData url
   return $ map (getRankedSolo5x5 . getDivision r) summonerIds
   where sids = intercalate "," . map txt $ summonerIds
-        url = "api/lol/eune/v2.5/league/by-summoner/" ++ sids ++ "/entry"
         getRankedSolo5x5 = maybe "Unranked" (\(_, t, d) -> t ++ " " ++ d)
                            . headMay . filter ((== "RANKED_SOLO_5x5") . (^. _1))
         getDivision json sid = (json ^.. responseBody . key (txt sid) . values
@@ -115,18 +121,27 @@ getChampionName championId = getName <$> getData url
         getName = (^?! responseBody . key "name" . _String)
 
 app :: App ()
-app = do
-  name <- headMay <$> getArgs >>= maybe (throw "Need summoner name as argument") return
-  getSummonerId name >>= getCurrentGame "EUN1" >>= putStrLn . pack . ppShow
+app = getSummonerId >>= getCurrentGame >>= putStrLn . pack . ppShow
 
-parseConfig :: ErrorT AppError IO Config
-parseConfig = do
+parseApiConfig :: ErrorT AppError IO ApiConfig
+parseApiConfig = do
   json <- readFile "config.json" `catchAny` fileError
-  let cfg = decode json :: Maybe Config
+  let cfg = decode json :: Maybe ApiConfig
   maybe parseError return cfg
   where fileError = const $ throw "Cannot find config file"
         parseError = throw "Cannot parse config file"
 
+parseArgs :: ErrorT AppError IO (Text, Text)
+parseArgs = do
+  region <- (headMay <$> getArgs) `orThrow` "Need summoner region as first argument"
+  name <- (headMay . tailEx <$> getArgs) `orThrow` "Need summoner name as second argument"
+  return (region, name)
+  where orThrow action msg = action >>= maybe (throw msg) return
+
 main :: IO ()
-main = withSession $ \sess ->
-  runErrorT parseConfig >>= either print ((runApp app >=> either print return) . (sess,))
+main = withSession $ \sess -> do
+  let cfg = do
+        apiConfig <- parseApiConfig
+        (region, name) <- parseArgs
+        return $ Config apiConfig sess region name
+  runErrorT cfg >>= either print (runApp app >=> either print return)
