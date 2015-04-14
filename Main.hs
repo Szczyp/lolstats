@@ -14,7 +14,7 @@ import           Control.Lens
 import           Control.Monad.Base
 import           Control.Monad.Error
 import           Control.Monad.Trans.Control
-import           Data.Aeson                      (FromJSON, ToJSON, decode)
+import           Data.Aeson                      (FromJSON, decode)
 import           Data.Aeson.Lens
 import           Data.Text                       (replace)
 import           Network.HTTP.Client             (HttpException (StatusCodeException))
@@ -40,9 +40,7 @@ instance Show AppError where
 instance Error AppError where
   strMsg = AppError . pack
 
-data ApiConfig = ApiConfig { apiUrl :: Text
-                           , apiKey :: Text
-                           } deriving (Show, Generic)
+data ApiConfig = ApiConfig { apiKey :: Text } deriving (Show, Generic)
 instance FromJSON ApiConfig
 
 data Config = Config { cApi     :: ApiConfig
@@ -64,27 +62,31 @@ catchHttp :: IO a -> (HttpException -> Text) -> App a
 catchHttp action handler = liftIO (catch (Right <$> action) (return . Left . handler))
                            >>= either throw return
 
+urlRoot :: Text -> Text
+urlRoot region = "https://" ++ region ++ ".api.pvp.net/"
+
 getData :: Text -> App (Response LByteString)
 getData url = do
-  (sess, (ApiConfig aUrl aKey)) <- (cSession &&& cApi) <$> ask
+  Config {cSession = sess, cApi = (ApiConfig aKey)} <- ask
   let opts = defaults & param "api_key" .~ [aKey]
-  getWith opts sess (unpack $ aUrl ++ url) `catchHttp` handler
-  where handler (StatusCodeException s _ _) = decodeUtf8 $ s ^. statusMessage
-        handler _ = "Network Error"
+  getWith opts sess (unpack url) `catchHttp` handler
+  where handler (StatusCodeException s _ _) = handlerError . decodeUtf8 $ s ^. statusMessage
+        handler _ = handlerError "Network Error"
+        handlerError msg = msg ++ " (" ++ url ++ ")"
 
 getSummonerId :: App Integer
 getSummonerId = do
-  (name, region) <- (cName &&& cRegion) <$> ask
-  let url = "api/lol/" ++ toLower region ++ "/v1.4/summoner/by-name/" ++ name
+  (name, region) <- (cName &&& toLower . cRegion) <$> ask
+  let url = urlRoot region ++ "api/lol/" ++ region ++ "/v1.4/summoner/by-name/" ++ name
       nameKey = key . toLower . replace " " "" $ name
       getId = (^? responseBody . nameKey . key "id" . _Integer)
   getId <$> getData url >>= maybe (throw "Can't get summoner id") return
 
 getCurrentGame :: Integer -> App [[(Text, Text, Text)]]
 getCurrentGame summonerId = do
-  region <- toUpper . take 3 . cRegion <$> ask
-  let url = "observer-mode/rest/consumer/getSpectatorGameInfo"
-            ++ "/" ++ region ++ "1/" ++ (txt summonerId)
+  (region, platform) <- (toLower . cRegion &&& getPlatform) <$> ask
+  let url = urlRoot region ++ "observer-mode/rest/consumer/getSpectatorGameInfo" ++ "/"
+            ++ platform ++ (txt summonerId)
   participants <- getParticipants <$> getData url
   (divisions, champions) <- runConcurrently $ (,)
                             <$> Concurrently (getDivisions participants)
@@ -99,11 +101,13 @@ getCurrentGame summonerId = do
                                        , o ^?! key "championId" . _Integer)))
         getDivisions = getSummonersDivision . map (^. _2)
         getChampions = mapConcurrently $ getChampionName . (^. _4)
+        getPlatform = (++ "1/") . toUpper . take 3 . cRegion
 
 getSummonersDivision :: [Integer] -> App [Text]
 getSummonersDivision summonerIds = do
-  region <- cRegion <$> ask
-  let url = "api/lol/" ++ toLower region ++ "/v2.5/league/by-summoner/" ++ sids ++ "/entry"
+  region <- toLower . cRegion <$> ask
+  let url = urlRoot region ++ "api/lol/" ++ region ++ "/v2.5/league/by-summoner/"
+            ++ sids ++ "/entry"
   r <- getData url
   return $ map (getRankedSolo5x5 . getDivision r) summonerIds
   where sids = intercalate "," . map txt $ summonerIds
@@ -117,7 +121,7 @@ getSummonersDivision summonerIds = do
 
 getChampionName :: Integer -> App Text
 getChampionName championId = getName <$> getData url
-  where url = "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
+  where url = urlRoot "global" ++ "api/lol/static-data/euw/v1.2/champion/" ++ txt championId
         getName = (^?! responseBody . key "name" . _String)
 
 app :: App ()
