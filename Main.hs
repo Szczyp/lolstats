@@ -94,11 +94,12 @@ getCurrentGame summonerId = do
   return $ map (map (\(c, n, d, _) -> (c, n, d)))
          $ groupAllOn (^. _4)
          $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
-  where getParticipants = (^.. responseBody . key "participants" . values
-                           . to (\o -> ( o ^?! key "summonerName" . _String
-                                       , o ^?! key "summonerId" . _Integer
-                                       , o ^?! key "teamId" . _Integer
-                                       , o ^?! key "championId" . _Integer)))
+  where getParticipants = toListOf $ responseBody . key "participants" . values
+                          . to ((,,,)
+                                <$> (^?! key "summonerName" . _String)
+                                <*> (^?! key "summonerId" . _Integer)
+                                <*> (^?! key "teamId" . _Integer)
+                                <*> (^?! key "championId" . _Integer))
         getDivisions = getSummonersDivision . map (^. _2)
         getChampions = mapConcurrently $ getChampionName . (^. _4)
         getPlatform = (++ "1/") . toUpper . take 3 . cRegion
@@ -113,15 +114,16 @@ getSummonersDivision summonerIds = do
   where sids = intercalate "," . map txt $ summonerIds
         getRankedSolo5x5 = maybe "Unranked" (\(_, t, d) -> t ++ " " ++ d)
                            . headMay . filter ((== "RANKED_SOLO_5x5") . (^. _1))
-        getDivision json sid = (json ^.. responseBody . key (txt sid) . values
-                                . to (\o -> ( o ^?! key "queue" . _String
-                                            , o ^?! key "tier" . _String
-                                            , o ^?! key "entries" . nth 0 . key "division"
-                                              . _String)))
+        getDivision json sid = json ^.. responseBody . key (txt sid) . values
+                               . to ((,,)
+                                     <$> (^?! key "queue" . _String)
+                                     <*> (^?! key "tier" . _String)
+                                     <*> (^?! key "entries" . nth 0 . key "division"
+                                          . _String))
 
 getChampionName :: Integer -> App Text
 getChampionName championId = getName <$> getData url
-  where url = urlRoot "global" ++ "api/lol/static-data/euw/v1.2/champion/" ++ txt championId
+  where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
         getName = (^?! responseBody . key "name" . _String)
 
 app :: App ()
