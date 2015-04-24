@@ -12,22 +12,26 @@ import           ClassyPrelude
 import           Control.Concurrent.Async.Lifted
 import           Control.Lens
 import           Control.Monad.Base
-import           Control.Monad.Error
+import           Control.Monad.Error             (Error, ErrorT, MonadError,
+                                                  runErrorT, strMsg, throwError)
+import           Control.Monad.State             (MonadState, StateT, get,
+                                                  modify, runStateT)
 import           Control.Monad.Trans.Control
-import           Data.Aeson                      (FromJSON, decode)
+import           Data.Aeson                      (FromJSON, decode, encode)
 import           Data.Aeson.Lens
 import           Data.Text                       (replace)
 import           Network.HTTP.Client             (HttpException (StatusCodeException))
-import           Network.Wreq                    hiding (getWith)
-import           Network.Wreq.Session
-import           Text.Show.Pretty
+import           Network.Wreq                    (Response, defaults, param,
+                                                  responseBody, statusMessage)
+import           Network.Wreq.Session            (Session, getWith, withSession)
+import           Text.Show.Pretty                (ppShow)
 
-newtype App a = App (ReaderT Config (ErrorT AppError IO) a)
+newtype App a = App (ReaderT Config (StateT Cache (ErrorT AppError IO)) a)
               deriving (Functor, Applicative, Monad, MonadIO, MonadReader Config
-                       , MonadError AppError, MonadBase IO)
+                       , MonadState Cache, MonadError AppError, MonadBase IO)
 
 instance MonadBaseControl IO App where
-  type StM App a = Either AppError a
+  type StM App a = Either AppError (a, Cache)
   liftBaseWith f = App $ liftBaseWith $ \run -> f (run . unApp)
     where unApp (App a) = a
   restoreM = App . restoreM
@@ -49,14 +53,17 @@ data Config = Config { cApi     :: ApiConfig
                      , cName    :: Text
                      } deriving (Show)
 
+type Cache = Map Text Text
+
 txt :: Show a => a -> Text
 txt = pack . show
 
 throw :: MonadError AppError m => Text -> m a
 throw = throwError . AppError
 
-runApp :: Show a => App a -> Config -> IO (Either AppError a)
-runApp (App a) = runErrorT . runReaderT a
+runApp :: Show a => App a -> Config -> Cache
+       -> ErrorT AppError IO (a, Cache)
+runApp (App a) c s = runStateT (runReaderT a c) s
 
 catchHttp :: IO a -> (HttpException -> Text) -> App a
 catchHttp action handler = liftIO (catch (Right <$> action) (return . Left . handler))
@@ -91,6 +98,7 @@ getCurrentGame summonerId = do
   (divisions, champions) <- runConcurrently $ (,)
                             <$> Concurrently (getDivisions participants)
                             <*> Concurrently (getChampions participants)
+  updateCache participants champions
   return $ map (map (\(c, n, d, _) -> (c, n, d)))
          $ groupAllOn (^. _4)
          $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
@@ -103,6 +111,7 @@ getCurrentGame summonerId = do
         getDivisions = getSummonersDivision . map (^. _2)
         getChampions = mapConcurrently $ getChampionName . (^. _4)
         getPlatform = (++ "1/") . toUpper . take 3 . cRegion
+        updateCache p c = modify (++ mapFromList (zip (map (txt . (^. _4)) p) c))
 
 getSummonersDivision :: [Integer] -> App [Text]
 getSummonersDivision summonerIds = do
@@ -122,7 +131,8 @@ getSummonersDivision summonerIds = do
                                           . _String))
 
 getChampionName :: Integer -> App Text
-getChampionName championId = getName <$> getData url
+getChampionName championId = lookup (txt championId) <$> get
+                             >>= maybe (getName <$> getData url) return
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
         getName = (^?! responseBody . key "name" . _String)
 
@@ -132,7 +142,7 @@ app = getSummonerId >>= getCurrentGame >>= putStrLn . pack . ppShow
 parseApiConfig :: ErrorT AppError IO ApiConfig
 parseApiConfig = do
   json <- readFile "config.json" `catchAny` fileError
-  let cfg = decode json :: Maybe ApiConfig
+  let cfg = decode json
   maybe parseError return cfg
   where fileError = const $ throw "Cannot find config file"
         parseError = throw "Cannot parse config file"
@@ -144,10 +154,17 @@ parseArgs = do
   return (region, name)
   where orThrow action msg = action >>= maybe (throw msg) return
 
+main' :: Session -> ErrorT AppError IO ()
+main' sess = do
+  apiConfig <- parseApiConfig
+  (region, name) <- parseArgs
+  let cfg = Config apiConfig sess region name
+  (result, cache) <- runApp app cfg =<< readCache
+  writeCache cache
+  return result
+  where readCache = readFile "champions.json" `catchAny` const (return "")
+                                >>= return . fromMaybe mempty . decode
+        writeCache = writeFile "champions.json" . encode
+
 main :: IO ()
-main = withSession $ \sess -> do
-  let cfg = do
-        apiConfig <- parseApiConfig
-        (region, name) <- parseArgs
-        return $ Config apiConfig sess region name
-  runErrorT cfg >>= either print (runApp app >=> either print return)
+main = withSession (either print return <=< runErrorT . main')
