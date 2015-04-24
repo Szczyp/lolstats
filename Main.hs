@@ -32,7 +32,7 @@ newtype App a = App (ReaderT Config (StateT Cache (ErrorT AppError IO)) a)
 
 instance MonadBaseControl IO App where
   type StM App a = Either AppError (a, Cache)
-  liftBaseWith f = App $ liftBaseWith $ \run -> f (run . unApp)
+  liftBaseWith f = App $ liftBaseWith $ \r -> f (r . unApp)
     where unApp (App a) = a
   restoreM = App . restoreM
 
@@ -55,14 +55,15 @@ data Config = Config { cApi     :: ApiConfig
 
 type Cache = Map Text Text
 
+type GameInfo = [[(Text, Text, Text)]]
+
 txt :: Show a => a -> Text
 txt = pack . show
 
 throw :: MonadError AppError m => Text -> m a
 throw = throwError . AppError
 
-runApp :: Show a => App a -> Config -> Cache
-       -> ErrorT AppError IO (a, Cache)
+runApp :: Show a => App a -> Config -> Cache -> ErrorT AppError IO (a, Cache)
 runApp (App a) c s = runStateT (runReaderT a c) s
 
 catchHttp :: IO a -> (HttpException -> Text) -> App a
@@ -89,7 +90,7 @@ getSummonerId = do
       getId = (^? responseBody . nameKey . key "id" . _Integer)
   getId <$> getData url >>= maybe (throw "Can't get summoner id") return
 
-getCurrentGame :: Integer -> App [[(Text, Text, Text)]]
+getCurrentGame :: Integer -> App GameInfo
 getCurrentGame summonerId = do
   (region, platform) <- (toLower . cRegion &&& getPlatform) <$> ask
   let url = urlRoot region ++ "observer-mode/rest/consumer/getSpectatorGameInfo" ++ "/"
@@ -136,14 +137,9 @@ getChampionName championId = lookup (txt championId) <$> get
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
         getName = (^?! responseBody . key "name" . _String)
 
-app :: App ()
-app = getSummonerId >>= getCurrentGame >>= putStrLn . pack . ppShow
-
 parseApiConfig :: ErrorT AppError IO ApiConfig
-parseApiConfig = do
-  json <- readFile "config.json" `catchAny` fileError
-  let cfg = decode json
-  maybe parseError return cfg
+parseApiConfig = readFile "config.json" `catchAny` fileError
+                 >>= maybe parseError return . decode
   where fileError = const $ throw "Cannot find config file"
         parseError = throw "Cannot parse config file"
 
@@ -154,8 +150,8 @@ parseArgs = do
   return (region, name)
   where orThrow action msg = action >>= maybe (throw msg) return
 
-main' :: Session -> ErrorT AppError IO ()
-main' sess = do
+run :: Session -> ErrorT AppError IO GameInfo
+run sess = do
   apiConfig <- parseApiConfig
   (region, name) <- parseArgs
   let cfg = Config apiConfig sess region name
@@ -166,5 +162,8 @@ main' sess = do
                                 >>= return . fromMaybe mempty . decode
         writeCache = writeFile "champions.json" . encode
 
+app :: App GameInfo
+app = getSummonerId >>= getCurrentGame
+
 main :: IO ()
-main = withSession (either print return <=< runErrorT . main')
+main = withSession (either print (putStrLn . pack . ppShow) <=< runErrorT . run)
