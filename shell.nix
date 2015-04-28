@@ -9,7 +9,7 @@ haskellPackages.cabal.mkDerivation (self: {
   buildDepends = with haskellPackages; [ aeson classyPrelude httpClient lens lensAeson
   	       	      		       	 liftedAsync monadControl mtl prettyShow text wreq ];
   buildTools = with haskellPackages; [ cabalInstall_1_20_0_6 ghcMod stylishHaskell hoogle
-  	       	    		       hasktags ];
+  	       	    		       hasktags hlint ];
   meta = {
     description = "lolstats";
     license = self.stdenv.lib.licenses.gpl3;

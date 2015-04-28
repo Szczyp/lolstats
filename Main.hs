@@ -64,7 +64,7 @@ throw :: MonadError AppError m => Text -> m a
 throw = throwError . AppError
 
 runApp :: Show a => App a -> Config -> Cache -> ErrorT AppError IO (a, Cache)
-runApp (App a) c s = runStateT (runReaderT a c) s
+runApp (App a) c = runStateT (runReaderT a c)
 
 catchHttp :: IO a -> (HttpException -> Text) -> App a
 catchHttp action handler = liftIO (catch (Right <$> action) (return . Left . handler))
@@ -94,7 +94,7 @@ getCurrentGame :: Integer -> App GameInfo
 getCurrentGame summonerId = do
   (region, platform) <- (toLower . cRegion &&& getPlatform) <$> ask
   let url = urlRoot region ++ "observer-mode/rest/consumer/getSpectatorGameInfo" ++ "/"
-            ++ platform ++ (txt summonerId)
+            ++ platform ++ txt summonerId
   participants <- getParticipants <$> getData url
   (divisions, champions) <- runConcurrently $ (,)
                             <$> Concurrently (getDivisions participants)
@@ -158,8 +158,8 @@ run sess = do
   (result, cache) <- runApp app cfg =<< readCache
   writeCache cache
   return result
-  where readCache = readFile "champions.json" `catchAny` const (return "")
-                                >>= return . fromMaybe mempty . decode
+  where readCache = fromMaybe mempty . decode
+                    <$> readFile "champions.json" `catchAny` const (return "")
         writeCache = writeFile "champions.json" . encode
 
 app :: App GameInfo
