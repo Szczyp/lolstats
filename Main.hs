@@ -12,7 +12,7 @@ import           ClassyPrelude
 import           Control.Concurrent.Async.Lifted
 import           Control.Lens
 import           Control.Monad.Base
-import           Control.Monad.Except            (Except, ExceptT, MonadError,
+import           Control.Monad.Except            (ExceptT, MonadError,
                                                   runExceptT, throwError)
 import           Control.Monad.State             (MonadState, StateT, get,
                                                   modify, runStateT)
