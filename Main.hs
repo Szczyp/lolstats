@@ -8,9 +8,9 @@
 
 module Main where
 
-import           ClassyPrelude
+import           ClassyPrelude                   hiding ((<>))
 import           Control.Concurrent.Async.Lifted
-import           Control.Lens
+import           Control.Lens                    hiding (argument)
 import           Control.Monad.Base
 import           Control.Monad.Except            (ExceptT, MonadError,
                                                   runExceptT, throwError)
@@ -24,6 +24,7 @@ import           Network.HTTP.Client             (HttpException (StatusCodeExcep
 import           Network.Wreq                    (Response, defaults, param,
                                                   responseBody, statusMessage)
 import           Network.Wreq.Session            (Session, getWith, withSession)
+import           Options.Applicative
 import           Text.Show.Pretty                (ppShow)
 
 newtype App a = App (ReaderT Config (StateT Cache (ExceptT AppError IO)) a)
@@ -64,7 +65,7 @@ runApp :: Show a => App a -> Config -> Cache -> ExceptT AppError IO (a, Cache)
 runApp (App a) c = runStateT (runReaderT a c)
 
 catchHttp :: IO a -> (HttpException -> Text) -> App a
-catchHttp action handler = liftIO (catch (Right <$> action) (return . Left . handler))
+catchHttp act handler = liftIO (catch (Right <$> act) (return . Left . handler))
                            >>= either throw return
 
 urlRoot :: Text -> Text
@@ -140,17 +141,18 @@ parseApiConfig = readFile "config.json" `catchAny` fileError
   where fileError = const $ throw "Cannot find config file"
         parseError = throw "Cannot parse config file"
 
-parseArgs :: ExceptT AppError IO (Text, Text)
-parseArgs = do
-  region <- (headMay <$> getArgs) `orThrow` "Need summoner region as first argument"
-  name <- (headMay . tailEx <$> getArgs) `orThrow` "Need summoner name as second argument"
-  return (region, name)
-  where orThrow action msg = action >>= maybe (throw msg) return
+parseArgs :: IO (Text, Text)
+parseArgs = execParser $ info (helper <*> parser)
+        (fullDesc
+         <> progDesc "Get current game info for SUMMONER in REGION (na euw eune)"
+         <> header "lolstats")
+  where parser = (,)
+                 <$> (pack <$> strArgument (metavar "REGION"))
+                 <*> (pack <$> strArgument (metavar "SUMMONER"))
 
-run :: Session -> ExceptT AppError IO GameInfo
-run sess = do
+run :: (Text, Text) -> Session -> ExceptT AppError IO GameInfo
+run (region, name) sess = do
   apiConfig <- parseApiConfig
-  (region, name) <- parseArgs
   let cfg = Config apiConfig sess region name
   (result, cache) <- runApp app cfg =<< readCache
   writeCache cache
@@ -164,4 +166,6 @@ app :: App GameInfo
 app = getSummonerId >>= getCurrentGame
 
 main :: IO ()
-main = withSession (either print (putStrLn . pack . ppShow) <=< runExceptT . run)
+main = do
+  args <- parseArgs
+  withSession (either print (putStrLn . pack . ppShow) <=< runExceptT . run args)
