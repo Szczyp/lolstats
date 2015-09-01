@@ -22,6 +22,7 @@ executable lolstats
   -- other-extensions:    
   build-depends:       aeson
                      , base
+                     , boxes
                      , classy-prelude
                      , http-client
                      , lens
@@ -30,7 +31,6 @@ executable lolstats
                      , monad-control
                      , mtl
                      , optparse-applicative
-                     , pretty-show
                      , text
                      , transformers-base
                      , wreq

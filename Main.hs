@@ -19,13 +19,14 @@ import           Control.Monad.State             (MonadState, StateT, get,
 import           Control.Monad.Trans.Control
 import           Data.Aeson                      (FromJSON, decode, encode)
 import           Data.Aeson.Lens
+import           Data.List                       (transpose)
 import           Data.Text                       (replace)
 import           Network.HTTP.Client             (HttpException (StatusCodeException))
 import           Network.Wreq                    (Response, defaults, param,
                                                   responseBody, statusMessage)
 import           Network.Wreq.Session            (Session, getWith, withSession)
 import           Options.Applicative
-import           Text.Show.Pretty                (ppShow)
+import           Text.PrettyPrint.Boxes          hiding ((<>))
 
 newtype App a = App (ReaderT Config (StateT Cache (ExceptT AppError IO)) a)
               deriving (Functor, Applicative, Monad, MonadIO, MonadReader Config
@@ -61,26 +62,22 @@ txt = pack . show
 throw :: MonadError AppError m => Text -> m a
 throw = throwError . AppError
 
-runApp :: Show a => App a -> Config -> Cache -> ExceptT AppError IO (a, Cache)
-runApp (App a) c = runStateT (runReaderT a c)
-
-catchHttp :: IO a -> (HttpException -> Text) -> App a
-catchHttp act handler = liftIO (catch (Right <$> act) (return . Left . handler))
-                           >>= either throw return
-
 urlRoot :: Text -> Text
 urlRoot region = "https://" ++ region ++ ".api.pvp.net/"
 
-getData :: Text -> App (Response LByteString)
+getData :: (MonadReader Config m, MonadError AppError m, MonadIO m)
+           => Text -> m (Response LByteString)
 getData url = do
   Config {cSession = sess, cApi = (ApiConfig aKey)} <- ask
   let opts = defaults & param "api_key" .~ [aKey]
-  getWith opts sess (unpack url) `catchHttp` handler
-  where handler (StatusCodeException s _ _) = handlerError . decodeUtf8 $ s ^. statusMessage
-        handler _ = handlerError "Network Error"
-        handlerError msg = msg ++ " (" ++ url ++ ")"
+  getWith opts sess (unpack url) `catchHttp` handleError
+  where handleError (StatusCodeException s _ _) = errorMsg . decodeUtf8 $ s ^. statusMessage
+        handleError _ = errorMsg "Network Error"
+        errorMsg msg = msg ++ " (" ++ url ++ ")"
+        catchHttp act handler = liftIO (catch (Right <$> act) (return . Left . handler))
+                                >>= either throw return
 
-getSummonerId :: App Integer
+getSummonerId :: (MonadReader Config m, MonadError AppError m, MonadIO m) => m Integer
 getSummonerId = do
   (name, region) <- (cName &&& toLower . cRegion) <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v1.4/summoner/by-name/" ++ name
@@ -99,7 +96,7 @@ getCurrentGame summonerId = do
                             <*> Concurrently (getChampions participants)
   updateCache participants champions
   return $ map (map (\(c, n, d, _) -> (c, n, d)))
-         $ groupAllOn (^. _4)
+         $ groupAllOn (view _4)
          $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
   where getParticipants = toListOf $ responseBody . key "participants" . values
                           . to ((,,,)
@@ -107,12 +104,13 @@ getCurrentGame summonerId = do
                                 <*> (^?! key "summonerId" . _Integer)
                                 <*> (^?! key "teamId" . _Integer)
                                 <*> (^?! key "championId" . _Integer))
-        getDivisions = getSummonersDivision . map (^. _2)
-        getChampions = mapConcurrently $ getChampionName . (^. _4)
+        getDivisions = getSummonersDivision . map (view _2)
+        getChampions = mapConcurrently $ getChampionName . view _4
         getPlatform = (++ "1/") . toUpper . take 3 . cRegion
-        updateCache p c = modify (++ mapFromList (zip (map (txt . (^. _4)) p) c))
+        updateCache p c = modify (++ mapFromList (zip (map (txt . view _4) p) c))
 
-getSummonersDivision :: [Integer] -> App [Text]
+getSummonersDivision :: (MonadReader Config m, MonadError AppError m, MonadIO m)
+                        => [Integer] -> m [Text]
 getSummonersDivision summonerIds = do
   region <- toLower . cRegion <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v2.5/league/by-summoner/"
@@ -121,7 +119,7 @@ getSummonersDivision summonerIds = do
   return $ map (getRankedSolo5x5 . getDivision r) summonerIds
   where sids = intercalate "," . map txt $ summonerIds
         getRankedSolo5x5 = maybe "Unranked" (\(_, t, d) -> t ++ " " ++ d)
-                           . headMay . filter ((== "RANKED_SOLO_5x5") . (^. _1))
+                           . headMay . filter ((== "RANKED_SOLO_5x5") . view _1)
         getDivision json sid = json ^.. responseBody . key (txt sid) . values
                                . to ((,,)
                                      <$> (^?! key "queue" . _String)
@@ -135,7 +133,7 @@ getChampionName championId = lookup (txt championId) <$> get
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
         getName = (^?! responseBody . key "name" . _String)
 
-parseApiConfig :: ExceptT AppError IO ApiConfig
+parseApiConfig :: (MonadError AppError m, MonadIO m, MonadBaseControl IO m) => m ApiConfig
 parseApiConfig = readFile "config.json" `catchAny` fileError
                  >>= maybe parseError return . decode
   where fileError = const $ throw "Cannot find config file"
@@ -150,11 +148,11 @@ parseArgs = execParser $ info (helper <*> parser)
                  <$> (pack <$> strArgument (metavar "REGION"))
                  <*> (pack <$> strArgument (metavar "SUMMONER"))
 
-run :: (Text, Text) -> Session -> ExceptT AppError IO GameInfo
-run (region, name) sess = do
+runApp :: App a -> (Text, Text) -> Session -> IO (Either AppError a)
+runApp (App app) (region, name) sess = runExceptT $ do
   apiConfig <- parseApiConfig
   let cfg = Config apiConfig sess region name
-  (result, cache) <- runApp app cfg =<< readCache
+  (result, cache) <- runStateT (runReaderT app cfg) =<< readCache
   writeCache cache
   return result
   where readCache = fromMaybe mempty . decode
@@ -162,10 +160,17 @@ run (region, name) sess = do
         writeCache cache = writeFile "champions.json" (encode cache)
                            `catchAny` const (throw "Cannot write cache file (champions.json)")
 
-app :: App GameInfo
-app = getSummonerId >>= getCurrentGame
+mainApp :: App GameInfo
+mainApp = getSummonerId >>= getCurrentGame
+
+printGameInfo :: GameInfo -> IO ()
+printGameInfo = printBox . hsep 6 left
+                . map (hsep 2 left
+                       . map (vcat left)
+                       . transpose
+                       . map (map (text . unpack) . toListOf each))
 
 main :: IO ()
 main = do
   args <- parseArgs
-  withSession (either print (putStrLn . pack . ppShow) <=< runExceptT . run args)
+  withSession (runApp mainApp args >=> either print printGameInfo)
