@@ -1,32 +1,26 @@
-{-# LANGUAGE DeriveGeneric              #-}
-{-# LANGUAGE FlexibleContexts           #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE MultiParamTypeClasses      #-}
-{-# LANGUAGE NoImplicitPrelude          #-}
-{-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE TypeFamilies               #-}
+{-# LANGUAGE DeriveGeneric, FlexibleContexts, GeneralizedNewtypeDeriving,
+             MultiParamTypeClasses, NoImplicitPrelude, OverloadedStrings, TypeFamilies #-}
 
 module Main where
 
-import           ClassyPrelude                   hiding ((<>))
-import           Control.Concurrent.Async.Lifted
-import           Control.Lens                    hiding (argument)
-import           Control.Monad.Base
-import           Control.Monad.Except            (ExceptT, MonadError,
-                                                  runExceptT, throwError)
-import           Control.Monad.State             (MonadState, StateT, get,
-                                                  modify, runStateT)
-import           Control.Monad.Trans.Control
-import           Data.Aeson                      (FromJSON, decode, encode)
-import           Data.Aeson.Lens
-import           Data.List                       (transpose)
-import           Data.Text                       (replace)
-import           Network.HTTP.Client             (HttpException (StatusCodeException))
-import           Network.Wreq                    (Response, defaults, param,
-                                                  responseBody, statusMessage)
-import           Network.Wreq.Session            (Session, getWith, withSession)
-import           Options.Applicative
-import           Text.PrettyPrint.Boxes          hiding ((<>))
+import ClassyPrelude                   hiding ((<>))
+import Control.Concurrent.Async.Lifted
+import Control.Lens                    hiding (argument)
+import Control.Monad.Base
+import Control.Monad.Except            (ExceptT, MonadError, runExceptT, throwError)
+import Control.Monad.State             (MonadState, StateT, get, modify, runStateT)
+import Control.Monad.Trans.Control
+import Data.Aeson                      (FromJSON, decode, encode)
+import Data.Aeson.Lens
+import Data.List                       (transpose)
+import Data.Text                       (replace)
+import Network.HTTP.Client             (HttpException (StatusCodeException))
+import Network.Wreq                    (Response, defaults, param, responseBody,
+                                        statusMessage)
+import Network.Wreq.Session            (Session, getWith, withSession)
+import Options.Applicative
+import System.Environment              (withArgs)
+import Text.PrettyPrint.Boxes          hiding ((<>))
 
 newtype App a = App (ReaderT Config (StateT Cache (ExceptT AppError IO)) a)
               deriving (Functor, Applicative, Monad, MonadIO, MonadReader Config
@@ -174,3 +168,6 @@ main :: IO ()
 main = do
   args <- parseArgs
   withSession (runApp mainApp args >=> either print printGameInfo)
+
+run :: String -> String -> IO ()
+run region summoner = withArgs [region, summoner] main
