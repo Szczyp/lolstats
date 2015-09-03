@@ -40,15 +40,21 @@ instance Show AppError where
 data ApiConfig = ApiConfig { apiKey :: Text } deriving (Show, Generic)
 instance FromJSON ApiConfig
 
-data Config = Config { cApi     :: ApiConfig
-                     , cSession :: Session
-                     , cRegion  :: Text
-                     , cName    :: Text
+data Config = Config { cApi      :: ApiConfig
+                     , cSession  :: Session
+                     , cRegion   :: Text
+                     , cPlatform :: Text
+                     , cName     :: Text
                      } deriving (Show)
 
 type Cache = Map Text Text
 
 type GameInfo = [[(Text, Text, Text)]]
+
+regionDict :: Map Text Text
+regionDict = mapFromList [("na", "NA1"), ("euw", "EUW1"), ("eune", "EUN1"), ("kr", "KR")
+                         ,("br", "BR1"), ("lan", "LA1") ,("las", "LA2") ,("ru", "RU")
+                         ,("oce", "OC1"),("tr", "TR1")]
 
 txt :: Show a => a -> Text
 txt = pack . show
@@ -73,17 +79,17 @@ getData url = do
 
 getSummonerId :: (MonadReader Config m, MonadError AppError m, MonadIO m) => m Integer
 getSummonerId = do
-  (name, region) <- (cName &&& toLower . cRegion) <$> ask
+  (name, region) <- (cName &&& cRegion) <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v1.4/summoner/by-name/" ++ name
-      nameKey = key . toLower . replace " " "" $ name
+      nameKey = key . replace " " "" $ name
       getId = (^? responseBody . nameKey . key "id" . _Integer)
   getId <$> getData url >>= maybe (throw "Can't get summoner id") return
 
 getCurrentGame :: Integer -> App GameInfo
 getCurrentGame summonerId = do
-  (region, platform) <- (toLower . cRegion &&& getPlatform) <$> ask
+  (region, platform) <- (cRegion &&& cPlatform) <$> ask
   let url = urlRoot region ++ "observer-mode/rest/consumer/getSpectatorGameInfo" ++ "/"
-            ++ platform ++ txt summonerId
+            ++ platform ++ "/" ++ txt summonerId
   participants <- getParticipants <$> getData url
   (divisions, champions) <- runConcurrently $ (,)
                             <$> Concurrently (getDivisions participants)
@@ -100,13 +106,12 @@ getCurrentGame summonerId = do
                                 <*> (^?! key "championId" . _Integer))
         getDivisions = getSummonersDivision . map (view _2)
         getChampions = mapConcurrently $ getChampionName . view _4
-        getPlatform = (++ "1/") . toUpper . take 3 . cRegion
         updateCache p c = modify (++ mapFromList (zip (map (txt . view _4) p) c))
 
 getSummonersDivision :: (MonadReader Config m, MonadError AppError m, MonadIO m)
                         => [Integer] -> m [Text]
 getSummonersDivision summonerIds = do
-  region <- toLower . cRegion <$> ask
+  region <- cRegion <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v2.5/league/by-summoner/"
             ++ sids ++ "/entry"
   r <- getData url
@@ -134,18 +139,16 @@ parseApiConfig = readFile "config.json" `catchAny` fileError
         parseError = throw "Cannot parse config file"
 
 parseArgs :: IO (Text, Text)
-parseArgs = execParser $ info (helper <*> parser)
-        (fullDesc
-         <> progDesc "Get current game info for SUMMONER in REGION (na euw eune)"
-         <> header "lolstats")
+parseArgs = execParser $ info (helper <*> parser) idm
   where parser = (,)
-                 <$> (pack <$> strArgument (metavar "REGION"))
-                 <*> (pack <$> strArgument (metavar "SUMMONER"))
+                 <$> (toLower . pack <$> strArgument (metavar "REGION"))
+                 <*> (toLower . pack <$> strArgument (metavar "SUMMONER"))
 
 runApp :: App a -> (Text, Text) -> Session -> IO (Either AppError a)
 runApp (App app) (region, name) sess = runExceptT $ do
   apiConfig <- parseApiConfig
-  let cfg = Config apiConfig sess region name
+  platform <- maybe (throw $ "unknown region " ++ region) return $ lookup region regionDict
+  let cfg = Config apiConfig sess region platform name
   (result, cache) <- runStateT (runReaderT app cfg) =<< readCache
   writeCache cache
   return result
@@ -162,7 +165,7 @@ printGameInfo = printBox . hsep 6 left
                 . map (hsep 2 left
                        . map (vcat left)
                        . transpose
-                       . map (map (text . unpack) . toListOf each))
+                       . map (toListOf $ each . to (text . unpack)))
 
 main :: IO ()
 main = do
