@@ -15,8 +15,7 @@ import Data.Aeson.Lens
 import Data.List                       (transpose)
 import Data.Text                       (replace)
 import Network.HTTP.Client             (HttpException (StatusCodeException))
-import Network.Wreq                    (Response, defaults, param, responseBody,
-                                        statusMessage)
+import Network.Wreq                    (defaults, param, responseBody, statusMessage)
 import Network.Wreq.Session            (Session, getWith, withSession)
 import Options.Applicative
 import System.Environment              (withArgs)
@@ -62,19 +61,27 @@ txt = pack . show
 throw :: MonadError AppError m => Text -> m a
 throw = throwError . AppError
 
+(???) :: Monad m => Maybe b -> m b -> m b
+(???) a b = maybe b return a
+infix 3 ???
+
+(!??) :: Monad m => m (Maybe b) -> m b -> m b
+(!??) a b = maybe b return =<< a
+infix 3 !??
+
 urlRoot :: Text -> Text
 urlRoot region = "https://" ++ region ++ ".api.pvp.net/"
 
 getData :: (MonadReader Config m, MonadError AppError m, MonadIO m)
-           => Text -> m (Response LByteString)
+           => Text -> m LByteString
 getData url = do
   Config {cSession = sess, cApi = (ApiConfig aKey)} <- ask
   let opts = defaults & param "api_key" .~ [aKey]
-  getWith opts sess (unpack url) `catchHttp` handleError
+  view responseBody <$> getWith opts sess (unpack url) `catchHttp` handleError
   where handleError (StatusCodeException s _ _) = errorMsg . decodeUtf8 $ s ^. statusMessage
         handleError _ = errorMsg "Network Error"
         errorMsg msg = msg ++ " (" ++ url ++ ")"
-        catchHttp act handler = liftIO (catch (Right <$> act) (return . Left . handler))
+        catchHttp act handler = liftIO ((Right <$> act) `catch` (return . Left . handler))
                                 >>= either throw return
 
 getSummonerId :: (MonadReader Config m, MonadError AppError m, MonadIO m) => m Integer
@@ -82,8 +89,8 @@ getSummonerId = do
   (name, region) <- (cName &&& cRegion) <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v1.4/summoner/by-name/" ++ name
       nameKey = key . replace " " "" $ name
-      getId = (^? responseBody . nameKey . key "id" . _Integer)
-  getId <$> getData url >>= maybe (throw "Can't get summoner id") return
+      getId = preview $ nameKey . key "id" . _Integer
+  getId <$> getData url !?? throw "Can't get summoner id"
 
 getCurrentGame :: Integer -> App GameInfo
 getCurrentGame summonerId = do
@@ -98,7 +105,7 @@ getCurrentGame summonerId = do
   return $ map (map (\(c, n, d, _) -> (c, n, d)))
          $ groupAllOn (view _4)
          $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
-  where getParticipants = toListOf $ responseBody . key "participants" . values
+  where getParticipants = toListOf $ key "participants" . values
                           . to ((,,,)
                                 <$> (^?! key "summonerName" . _String)
                                 <*> (^?! key "summonerId" . _Integer)
@@ -119,7 +126,7 @@ getSummonersDivision summonerIds = do
   where sids = intercalate "," . map txt $ summonerIds
         getRankedSolo5x5 = maybe "Unranked" (\(_, t, d) -> t ++ " " ++ d)
                            . headMay . filter ((== "RANKED_SOLO_5x5") . view _1)
-        getDivision json sid = json ^.. responseBody . key (txt sid) . values
+        getDivision json sid = json ^.. key (txt sid) . values
                                . to ((,,)
                                      <$> (^?! key "queue" . _String)
                                      <*> (^?! key "tier" . _String)
@@ -127,27 +134,24 @@ getSummonersDivision summonerIds = do
                                           . _String))
 
 getChampionName :: Integer -> App Text
-getChampionName championId = lookup (txt championId) <$> get
-                             >>= maybe (getName <$> getData url) return
+getChampionName championId = lookup (txt championId) <$> get !?? getName <$> getData url
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
-        getName = (^?! responseBody . key "name" . _String)
+        getName = (^?! key "name" . _String)
 
 parseApiConfig :: (MonadError AppError m, MonadIO m, MonadBaseControl IO m) => m ApiConfig
-parseApiConfig = readFile "config.json" `catchAny` fileError
-                 >>= maybe parseError return . decode
+parseApiConfig = decode <$> readFile "config.json" `catchAny` fileError !?? parseError
   where fileError = const $ throw "Cannot find config file"
         parseError = throw "Cannot parse config file"
 
 parseArgs :: IO (Text, Text)
 parseArgs = execParser $ info (helper <*> parser) idm
-  where parser = (,)
-                 <$> (toLower . pack <$> strArgument (metavar "REGION"))
-                 <*> (toLower . pack <$> strArgument (metavar "SUMMONER"))
+  where parser = (,) <$> arg "REGION" <*> arg "SUMMONER"
+        arg = map (toLower . pack) . strArgument . metavar
 
 runApp :: App a -> (Text, Text) -> Session -> IO (Either AppError a)
 runApp (App app) (region, name) sess = runExceptT $ do
   apiConfig <- parseApiConfig
-  platform <- maybe (throw $ "unknown region " ++ region) return $ lookup region regionDict
+  platform <- lookup region regionDict ??? throw ("unknown region " ++ region)
   let cfg = Config apiConfig sess region platform name
   (result, cache) <- runStateT (runReaderT app cfg) =<< readCache
   writeCache cache
