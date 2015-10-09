@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveGeneric, FlexibleContexts, GeneralizedNewtypeDeriving,
-             MultiParamTypeClasses, NoImplicitPrelude, OverloadedStrings, TypeFamilies #-}
+             MultiParamTypeClasses, NoImplicitPrelude, OverloadedStrings, TemplateHaskell,
+             TypeFamilies #-}
 
 module Main where
 
@@ -8,9 +9,9 @@ import Control.Concurrent.Async.Lifted
 import Control.Lens                    hiding (argument)
 import Control.Monad.Base
 import Control.Monad.Except            (ExceptT, MonadError, runExceptT, throwError)
-import Control.Monad.State             (MonadState, StateT, get, modify, runStateT)
+import Control.Monad.State             (MonadState, StateT, runStateT)
 import Control.Monad.Trans.Control
-import Data.Aeson                      (FromJSON, decode, encode)
+import Data.Aeson                      (FromJSON, ToJSON, decode, encode)
 import Data.Aeson.Lens
 import Data.List                       (transpose)
 import Data.Text                       (replace)
@@ -46,14 +47,26 @@ data Config = Config { cApi      :: ApiConfig
                      , cName     :: Text
                      } deriving (Show)
 
-type Cache = Map Text Text
+type SummonerCache = Map Text Integer
+
+type ChampionCache = Map Text Text
+
+data Cache = Cache { _cacheSummoners :: SummonerCache
+                   , _cacheChampions :: ChampionCache }
+             deriving (Show, Generic)
+instance FromJSON Cache
+instance ToJSON Cache
+makeLenses ''Cache
+
+emptyCache :: Cache
+emptyCache = Cache mempty mempty
 
 type GameInfo = [[(Text, Text, Text)]]
 
 regionDict :: Map Text Text
 regionDict = mapFromList [("na", "NA1"), ("euw", "EUW1"), ("eune", "EUN1"), ("kr", "KR")
-                         ,("br", "BR1"), ("lan", "LA1") ,("las", "LA2") ,("ru", "RU")
-                         ,("oce", "OC1"),("tr", "TR1")]
+                         ,("br", "BR1"), ("lan", "LA1"), ("las", "LA2"), ("ru", "RU")
+                         ,("oce", "OC1"), ("tr", "TR1")]
 
 txt :: Show a => a -> Text
 txt = pack . show
@@ -84,13 +97,18 @@ getData url = do
         catchHttp act handler = liftIO ((Right <$> act) `catch` (return . Left . handler))
                                 >>= either throw return
 
-getSummonerId :: (MonadReader Config m, MonadError AppError m, MonadIO m) => m Integer
+getSummonerId :: App Integer
 getSummonerId = do
   (name, region) <- (cName &&& cRegion) <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v1.4/summoner/by-name/" ++ name
       nameKey = key . replace " " "" $ name
+      summonerCacheKey = region ++ " | " ++ name
       getId = preview $ nameKey . key "id" . _Integer
-  getId <$> getData url !?? throw "Can't get summoner id"
+      fromCache = use $ cacheSummoners . at summonerCacheKey
+      fromApi = getId <$> getData url !?? throw "Can't get summoner id"
+  sid <- fromCache !?? fromApi
+  cacheSummoners %= insertMap summonerCacheKey sid
+  return sid
 
 getCurrentGame :: Integer -> App GameInfo
 getCurrentGame summonerId = do
@@ -113,7 +131,7 @@ getCurrentGame summonerId = do
                                 <*> (^?! key "championId" . _Integer))
         getDivisions = getSummonersDivision . map (view _2)
         getChampions = mapConcurrently $ getChampionName . view _4
-        updateCache p c = modify (++ mapFromList (zip (map (txt . view _4) p) c))
+        updateCache p c = cacheChampions %= (++ mapFromList (zip (map (txt . view _4) p) c))
 
 getSummonersDivision :: (MonadReader Config m, MonadError AppError m, MonadIO m)
                         => [Integer] -> m [Text]
@@ -134,7 +152,8 @@ getSummonersDivision summonerIds = do
                                           . _String))
 
 getChampionName :: Integer -> App Text
-getChampionName championId = lookup (txt championId) <$> get !?? getName <$> getData url
+getChampionName championId = use (cacheChampions . at (txt championId))
+                             !?? getName <$> getData url
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
         getName = (^?! key "name" . _String)
 
@@ -156,10 +175,10 @@ runApp (App app) (region, name) sess = runExceptT $ do
   (result, cache) <- runStateT (runReaderT app cfg) =<< readCache
   writeCache cache
   return result
-  where readCache = fromMaybe mempty . decode
-                    <$> readFile "champions.json" `catchAny` const (return "")
-        writeCache cache = writeFile "champions.json" (encode cache)
-                           `catchAny` const (throw "Cannot write cache file (champions.json)")
+  where readCache = fromMaybe emptyCache . decode
+                    <$> readFile "cache.json" `catchAny` const (return "")
+        writeCache cache = writeFile "cache.json" (encode cache)
+                           `catchAny` const (throw "Cannot write cache file (cache.json)")
 
 mainApp :: App GameInfo
 mainApp = getSummonerId >>= getCurrentGame
@@ -169,12 +188,12 @@ printGameInfo = printBox . hsep 6 left
                 . map (hsep 2 left
                        . map (vcat left)
                        . transpose
-                       . map (toListOf $ each . to (text . unpack)))
+                       . map (^.. each . to (text . unpack)))
 
 main :: IO ()
 main = do
   args <- parseArgs
   withSession (runApp mainApp args >=> either print printGameInfo)
 
-run :: String -> String -> IO ()
-run region summoner = withArgs [region, summoner] main
+lolstats :: String -> String -> IO ()
+lolstats region summoner = withArgs [region, summoner] main
