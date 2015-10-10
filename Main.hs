@@ -15,6 +15,7 @@ import Data.Aeson                      (FromJSON, ToJSON, decode, encode)
 import Data.Aeson.Lens
 import Data.List                       (transpose)
 import Data.Text                       (replace)
+import Data.Tuple.Sequence
 import Network.HTTP.Client             (HttpException (StatusCodeException))
 import Network.Wreq                    (defaults, param, responseBody, statusMessage)
 import Network.Wreq.Session            (Session, getWith, withSession)
@@ -115,22 +116,20 @@ getCurrentGame summonerId = do
   (region, platform) <- (cRegion &&& cPlatform) <$> ask
   let url = urlRoot region ++ "observer-mode/rest/consumer/getSpectatorGameInfo" ++ "/"
             ++ platform ++ "/" ++ txt summonerId
-  participants <- getParticipants <$> getData url
-  (divisions, champions) <- runConcurrently $ (,)
-                            <$> Concurrently (getDivisions participants)
-                            <*> Concurrently (getChampions participants)
+  participants <- getParticipants <$> getData url !?? throw "Illegal json"
+  let getDivisions = getSummonersDivision $ map (view _2) participants
+      getChampions = mapConcurrently (getChampionName . view _4) participants
+  (divisions, champions) <- runConcurrently $ each Concurrently (getDivisions, getChampions)
   updateCache participants champions
   return $ map (map (\(c, n, d, _) -> (c, n, d)))
          $ groupAllOn (view _4)
          $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
-  where getParticipants = toListOf $ key "participants" . values
+  where getParticipants = mapM sequenceT . toListOf (key "participants" . values
                           . to ((,,,)
-                                <$> (^?! key "summonerName" . _String)
-                                <*> (^?! key "summonerId" . _Integer)
-                                <*> (^?! key "teamId" . _Integer)
-                                <*> (^?! key "championId" . _Integer))
-        getDivisions = getSummonersDivision . map (view _2)
-        getChampions = mapConcurrently $ getChampionName . view _4
+                                <$> preview (key "summonerName" . _String)
+                                <*> preview (key "summonerId" . _Integer)
+                                <*> preview (key "teamId" . _Integer)
+                                <*> preview (key "championId" . _Integer)))
         updateCache p c = cacheChampions %= (++ mapFromList (zip (map (txt . view _4) p) c))
 
 getSummonersDivision :: (MonadReader Config m, MonadError AppError m, MonadIO m)
@@ -140,22 +139,21 @@ getSummonersDivision summonerIds = do
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v2.5/league/by-summoner/"
             ++ sids ++ "/entry"
   r <- getData url
-  return $ map (getRankedSolo5x5 . getDivision r) summonerIds
+  mapM (map getRankedSolo5x5 . getDivision r) summonerIds ??? throw "Illegal json"
   where sids = intercalate "," . map txt $ summonerIds
         getRankedSolo5x5 = maybe "Unranked" (\(_, t, d) -> t ++ " " ++ d)
                            . headMay . filter ((== "RANKED_SOLO_5x5") . view _1)
-        getDivision json sid = json ^.. key (txt sid) . values
+        getDivision json sid = mapM sequenceT $ json ^.. key (txt sid) . values
                                . to ((,,)
-                                     <$> (^?! key "queue" . _String)
-                                     <*> (^?! key "tier" . _String)
-                                     <*> (^?! key "entries" . nth 0 . key "division"
-                                          . _String))
+                                     <$> preview (key "queue" . _String)
+                                     <*> preview (key "tier" . _String)
+                                     <*> preview (key "entries" . nth 0 . key "division"
+                                                  . _String))
 
 getChampionName :: Integer -> App Text
-getChampionName championId = use (cacheChampions . at (txt championId))
-                             !?? getName <$> getData url
+getChampionName championId = use (cacheChampions . at (txt championId)) !?? getName
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
-        getName = (^?! key "name" . _String)
+        getName = preview (key "name" . _String) <$> getData url !?? throw "Illegal json"
 
 parseApiConfig :: (MonadError AppError m, MonadIO m, MonadBaseControl IO m) => m ApiConfig
 parseApiConfig = decode <$> readFile "config.json" `catchAny` fileError !?? parseError
