@@ -4,13 +4,14 @@
 
 module Main where
 
-import ClassyPrelude                   hiding ((<>))
+import ClassyPrelude                   hiding (log, (<>))
 import Control.Concurrent.Async.Lifted
 import Control.Lens                    hiding (argument)
 import Control.Monad.Base
 import Control.Monad.Except            (ExceptT, MonadError, runExceptT, throwError)
 import Control.Monad.State             (MonadState, StateT, runStateT)
 import Control.Monad.Trans.Control
+import Control.Monad.Writer            (MonadWriter, WriterT, runWriterT, tell)
 import Data.Aeson                      (FromJSON, ToJSON, decode, encode)
 import Data.Aeson.Lens
 import Data.List                       (transpose)
@@ -22,16 +23,6 @@ import Network.Wreq.Session            (Session, getWith, withSession)
 import Options.Applicative
 import System.Environment              (withArgs)
 import Text.PrettyPrint.Boxes          hiding ((<>))
-
-newtype App a = App (ReaderT Config (StateT Cache (ExceptT AppError IO)) a)
-              deriving (Functor, Applicative, Monad, MonadIO, MonadReader Config
-                       , MonadState Cache, MonadError AppError, MonadBase IO)
-
-instance MonadBaseControl IO App where
-  type StM App a = Either AppError (a, Cache)
-  liftBaseWith f = App $ liftBaseWith $ \r -> f (r . unApp)
-    where unApp (App a) = a
-  restoreM = App . restoreM
 
 newtype AppError = AppError Text
 
@@ -62,6 +53,18 @@ makeLenses ''Cache
 emptyCache :: Cache
 emptyCache = Cache mempty mempty
 
+type Log = [Text]
+
+newtype App a = App (ReaderT Config (StateT Cache (WriterT Log (ExceptT AppError IO))) a)
+              deriving (Functor, Applicative, Monad, MonadIO, MonadReader Config
+                       , MonadState Cache, MonadWriter Log, MonadError AppError, MonadBase IO)
+
+instance MonadBaseControl IO App where
+  type StM App a = Either AppError ((a, Cache), Log)
+  liftBaseWith f = App $ liftBaseWith $ \r -> f (r . unApp)
+    where unApp (App a) = a
+  restoreM = App . restoreM
+
 type GameInfo = [[(Text, Text, Text)]]
 
 regionDict :: Map Text Text
@@ -86,11 +89,12 @@ infix 3 !??
 urlRoot :: Text -> Text
 urlRoot region = "https://" ++ region ++ ".api.pvp.net/"
 
-getData :: (MonadReader Config m, MonadError AppError m, MonadIO m)
+getData :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m, MonadIO m)
            => Text -> m LByteString
 getData url = do
   Config {cSession = sess, cApi = (ApiConfig aKey)} <- ask
   let opts = defaults & param "api_key" .~ [aKey]
+  tell [url]
   view responseBody <$> getWith opts sess (unpack url) `catchHttp` handleError
   where handleError (StatusCodeException s _ _) = errorMsg . decodeUtf8 $ s ^. statusMessage
         handleError _ = errorMsg "Network Error"
@@ -132,7 +136,8 @@ getCurrentGame summonerId = do
                                 <*> preview (key "championId" . _Integer)))
         updateCache p c = cacheChampions %= (++ mapFromList (zip (map (txt . view _4) p) c))
 
-getSummonersDivision :: (MonadReader Config m, MonadError AppError m, MonadIO m)
+getSummonersDivision :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m
+                        , MonadIO m)
                         => [Integer] -> m [Text]
 getSummonersDivision summonerIds = do
   region <- cRegion <$> ask
@@ -160,18 +165,25 @@ parseApiConfig = decode <$> readFile "config.json" `catchAny` fileError !?? pars
   where fileError = const $ throw "Cannot find config file"
         parseError = throw "Cannot parse config file"
 
-parseArgs :: IO (Text, Text)
+type Args = (Region, Summoner, Debug)
+type Region = Text
+type Summoner = Text
+type Debug = Bool
+
+parseArgs :: IO Args
 parseArgs = execParser $ info (helper <*> parser) idm
-  where parser = (,) <$> arg "REGION" <*> arg "SUMMONER"
+  where parser = (,,) <$> arg "REGION" <*> arg "SUMMONER" <*> switch (long "debug")
         arg = map (toLower . pack) . strArgument . metavar
 
-runApp :: App a -> (Text, Text) -> Session -> IO (Either AppError a)
-runApp (App app) (region, name) sess = runExceptT $ do
+runApp :: App a -> Args -> Session -> IO (Either AppError a)
+runApp (App app) (region, name, debug) sess = runExceptT $ do
   apiConfig <- parseApiConfig
   platform <- lookup region regionDict ??? throw ("unknown region " ++ region)
   let cfg = Config apiConfig sess region platform name
-  (result, cache) <- runStateT (runReaderT app cfg) =<< readCache
-  writeCache cache
+  cache <- readCache
+  ((result, cache'), log) <- runWriterT (runStateT (runReaderT app cfg) cache)
+  writeCache cache'
+  when debug $ putStrLn (unlines log)
   return result
   where readCache = fromMaybe emptyCache . decode
                     <$> readFile "cache.json" `catchAny` const (return "")
