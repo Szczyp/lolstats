@@ -1,3 +1,4 @@
+{-# OPTIONS -fno-warn-name-shadowing #-}
 {-# LANGUAGE DeriveGeneric, FlexibleContexts, GeneralizedNewtypeDeriving,
              MultiParamTypeClasses, NoImplicitPrelude, OverloadedStrings, TemplateHaskell,
              TypeFamilies #-}
@@ -19,7 +20,7 @@ import Data.Text                       (replace)
 import Data.Tuple.Sequence
 import Network.HTTP.Client             (HttpException (StatusCodeException))
 import Network.Wreq                    (defaults, param, responseBody, statusMessage)
-import Network.Wreq.Session            (Session, getWith, withSession)
+import Network.Wreq.Session            (Session, getWith, withAPISession)
 import Options.Applicative
 import System.Environment              (withArgs)
 import Text.PrettyPrint.Boxes          hiding ((<>))
@@ -32,19 +33,19 @@ instance Show AppError where
 data ApiConfig = ApiConfig { apiKey :: Text } deriving (Show, Generic)
 instance FromJSON ApiConfig
 
-data Config = Config { cApi      :: ApiConfig
-                     , cSession  :: Session
-                     , cRegion   :: Text
-                     , cPlatform :: Text
-                     , cName     :: Text
+data Config = Config { api      :: ApiConfig
+                     , session  :: Session
+                     , region   :: Text
+                     , platform :: Text
+                     , name     :: Text
                      } deriving (Show)
 
 type SummonerCache = Map Text Integer
 
 type ChampionCache = Map Text Text
 
-data Cache = Cache { _cacheSummoners :: SummonerCache
-                   , _cacheChampions :: ChampionCache }
+data Cache = Cache { _summoners :: SummonerCache
+                   , _champions :: ChampionCache }
              deriving (Show, Generic)
 instance FromJSON Cache
 instance ToJSON Cache
@@ -92,32 +93,32 @@ urlRoot region = "https://" ++ region ++ ".api.pvp.net/"
 getData :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m, MonadIO m)
            => Text -> m LByteString
 getData url = do
-  Config {cSession = sess, cApi = (ApiConfig aKey)} <- ask
+  Config {session = session, api = (ApiConfig aKey)} <- ask
   let opts = defaults & param "api_key" .~ [aKey]
   tell [url]
-  view responseBody <$> getWith opts sess (unpack url) `catchHttp` handleError
+  view responseBody <$> getWith opts session (unpack url) `catchHttp` handleError
   where handleError (StatusCodeException s _ _) = errorMsg . decodeUtf8 $ s ^. statusMessage
         handleError _ = errorMsg "Network Error"
         errorMsg msg = msg ++ " (" ++ url ++ ")"
-        catchHttp act handler = liftIO ((Right <$> act) `catch` (return . Left . handler))
+        catchHttp action handler = liftIO ((Right <$> action) `catch` (return . Left . handler))
                                 >>= either throw return
 
 getSummonerId :: App Integer
 getSummonerId = do
-  (name, region) <- (cName &&& cRegion) <$> ask
+  (name, region) <- (name &&& region) <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v1.4/summoner/by-name/" ++ name
       nameKey = key . replace " " "" $ name
       summonerCacheKey = region ++ " | " ++ name
       getId = preview $ nameKey . key "id" . _Integer
-      fromCache = use $ cacheSummoners . at summonerCacheKey
+      fromCache = use $ summoners . at summonerCacheKey
       fromApi = getId <$> getData url !?? throw "Can't get summoner id"
   sid <- fromCache !?? fromApi
-  cacheSummoners %= insertMap summonerCacheKey sid
+  summoners %= insertMap summonerCacheKey sid
   return sid
 
 getCurrentGame :: Integer -> App GameInfo
 getCurrentGame summonerId = do
-  (region, platform) <- (cRegion &&& cPlatform) <$> ask
+  (region, platform) <- (region &&& platform) <$> ask
   let url = urlRoot region ++ "observer-mode/rest/consumer/getSpectatorGameInfo" ++ "/"
             ++ platform ++ "/" ++ txt summonerId
   participants <- getParticipants <$> getData url !?? throw "Illegal json"
@@ -134,13 +135,13 @@ getCurrentGame summonerId = do
                                 <*> preview (key "summonerId" . _Integer)
                                 <*> preview (key "teamId" . _Integer)
                                 <*> preview (key "championId" . _Integer)))
-        updateCache p c = cacheChampions %= (++ mapFromList (zip (map (txt . view _4) p) c))
+        updateCache p c = champions %= (++ mapFromList (zip (map (txt . view _4) p) c))
 
 getSummonersDivision :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m
                         , MonadIO m)
                         => [Integer] -> m [Text]
 getSummonersDivision summonerIds = do
-  region <- cRegion <$> ask
+  region <- region <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v2.5/league/by-summoner/"
             ++ sids ++ "/entry"
   r <- getData url
@@ -152,11 +153,10 @@ getSummonersDivision summonerIds = do
                                . to ((,,)
                                      <$> preview (key "queue" . _String)
                                      <*> preview (key "tier" . _String)
-                                     <*> preview (key "entries" . nth 0 . key "division"
-                                                  . _String))
+                                     <*> preview (key "entries" . nth 0 . key "division" . _String))
 
 getChampionName :: Integer -> App Text
-getChampionName championId = use (cacheChampions . at (txt championId)) !?? getName
+getChampionName championId = use (champions . at (txt championId)) !?? getName
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
         getName = preview (key "name" . _String) <$> getData url !?? throw "Illegal json"
 
@@ -176,13 +176,12 @@ parseArgs = execParser $ info (helper <*> parser) idm
         arg = map (toLower . pack) . strArgument . metavar
 
 runApp :: App a -> Args -> Session -> IO (Either AppError a)
-runApp (App app) (region, name, debug) sess = runExceptT $ do
+runApp (App app) (region, name, debug) session = runExceptT $ do
   apiConfig <- parseApiConfig
   platform <- lookup region regionDict ??? throw ("unknown region " ++ region)
-  let cfg = Config apiConfig sess region platform name
-  cache <- readCache
-  ((result, cache'), log) <- runWriterT (runStateT (runReaderT app cfg) cache)
-  writeCache cache'
+  let cfg = Config apiConfig session region platform name
+  ((result, cache), log) <- runWriterT (runStateT (runReaderT app cfg) =<< readCache)
+  writeCache cache
   when debug $ putStrLn (unlines log)
   return result
   where readCache = fromMaybe emptyCache . decode
@@ -203,7 +202,7 @@ printGameInfo = printBox . hsep 6 left
 main :: IO ()
 main = do
   args <- parseArgs
-  withSession (runApp mainApp args >=> either print printGameInfo)
+  withAPISession (runApp mainApp args >=> either print printGameInfo)
 
 lolstats :: String -> String -> IO ()
 lolstats region summoner = withArgs [region, summoner] main
