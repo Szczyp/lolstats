@@ -5,13 +5,12 @@
 
 module Main where
 
-import ClassyPrelude                   hiding (log, (<>))
+import ClassyPrelude                   hiding (log, (<>), Concurrently, throw, mapConcurrently
+                                              , runConcurrently)
 import Control.Concurrent.Async.Lifted
 import Control.Lens                    hiding (argument)
-import Control.Monad.Base
 import Control.Monad.Except            (ExceptT, MonadError, runExceptT, throwError)
 import Control.Monad.State             (MonadState, StateT, runStateT)
-import Control.Monad.Trans.Control
 import Control.Monad.Writer            (MonadWriter, WriterT, runWriterT, tell)
 import Data.Aeson                      (FromJSON, ToJSON, decode, encode)
 import Data.Aeson.Lens
@@ -147,20 +146,24 @@ getSummonersDivision summonerIds = do
   r <- getData url
   mapM (map getRankedSolo5x5 . getDivision r) summonerIds ??? throw "Illegal json"
   where sids = intercalate "," . map txt $ summonerIds
-        getRankedSolo5x5 = maybe "Unranked" (\(_, t, d) -> t ++ " " ++ d)
+        getRankedSolo5x5 = maybe "Unranked" format
                            . headMay . filter ((== "RANKED_SOLO_5x5") . view _1)
         getDivision json sid = mapM sequenceT $ json ^.. key (txt sid) . values
-                               . to ((,,)
+                               . to ((,,,)
                                      <$> preview (key "queue" . _String)
                                      <*> preview (key "tier" . _String)
-                                     <*> preview (key "entries" . nth 0 . key "division" . _String))
+                                     <*> preview (key "entries" . nth 0
+                                                  . key "division" . _String)
+                                     <*> preview (key "entries" . nth 0
+                                                  . key "leaguePoints" . _Integer))
+        format (_, tier, division, lps) = tier ++ " " ++ division ++ " (" ++ txt lps ++ ")"
 
 getChampionName :: Integer -> App Text
 getChampionName championId = use (champions . at (txt championId)) !?? getName
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
         getName = preview (key "name" . _String) <$> getData url !?? throw "Illegal json"
 
-parseApiConfig :: (MonadError AppError m, MonadIO m, MonadBaseControl IO m) => m ApiConfig
+parseApiConfig :: (MonadCatch m, MonadError AppError m, MonadIO m) => m ApiConfig
 parseApiConfig = decode <$> readFile "config.json" `catchAny` fileError !?? parseError
   where fileError = const $ throw "Cannot find config file"
         parseError = throw "Cannot parse config file"
