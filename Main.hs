@@ -176,7 +176,7 @@ type Debug = Bool
 parseArgs :: IO Args
 parseArgs = execParser $ info (helper <*> parser) idm
   where parser = (,,) <$> arg "REGION" <*> arg "SUMMONER" <*> switch (long "debug")
-        arg = map (toLower . pack) . strArgument . metavar
+        arg = map (toLower . replace " " "" . pack) . strArgument . metavar
 
 runApp :: App a -> Args -> Session -> IO (Either AppError a)
 runApp (App app) (region, name, debug) session = runExceptT $ do
