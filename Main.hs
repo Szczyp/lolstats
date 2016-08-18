@@ -136,8 +136,7 @@ getCurrentGame summonerId = do
                                 <*> preview (key "championId" . _Integer)))
         updateCache p c = champions %= (++ mapFromList (zip (map (txt . view _4) p) c))
 
-getSummonersDivision :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m
-                        , MonadIO m)
+getSummonersDivision :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m, MonadIO m)
                         => [Integer] -> m [Text]
 getSummonersDivision summonerIds = do
   region <- region <$> ask
@@ -148,15 +147,19 @@ getSummonersDivision summonerIds = do
   where sids = intercalate "," . map txt $ summonerIds
         getRankedSolo5x5 = maybe "Unranked" format
                            . headMay . filter ((== "RANKED_SOLO_5x5") . view _1)
-        getDivision json sid = mapM sequenceT $ json ^.. key (txt sid) . values
-                               . to ((,,,)
+        getDivision json sid = mapM (sequenceT . over _5 (Just . fromMaybe ""))
+                               $ json ^.. key (txt sid) . values
+                               . to ((,,,,)
                                      <$> preview (key "queue" . _String)
                                      <*> preview (key "tier" . _String)
                                      <*> preview (key "entries" . nth 0
                                                   . key "division" . _String)
                                      <*> preview (key "entries" . nth 0
-                                                  . key "leaguePoints" . _Integer))
-        format (_, tier, division, lps) = tier ++ " " ++ division ++ " (" ++ txt lps ++ ")"
+                                                  . key "leaguePoints" . _Integer)
+                                     <*> preview (key "entries" . nth 0
+                                                  . key "miniSeries" . key "progress" . _String))
+        format (_, tier, division, lps, series) = tier ++ " " ++ division
+          ++ " (" ++ (if lps == 100 then series else txt lps) ++ ")"
 
 getChampionName :: Integer -> App Text
 getChampionName championId = use (champions . at (txt championId)) !?? getName
