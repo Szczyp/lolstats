@@ -24,6 +24,7 @@ executable lolstats
                      , base
                      , boxes
                      , classy-prelude
+                     , directory
                      , http-client
                      , lens
                      , lens-aeson

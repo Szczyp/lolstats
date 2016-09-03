@@ -8,7 +8,7 @@ module Main where
 import ClassyPrelude                   hiding (log, (<>), Concurrently, throw, mapConcurrently
                                               , runConcurrently)
 import Control.Concurrent.Async.Lifted
-import Control.Lens                    hiding (argument)
+import Control.Lens                    hiding ((<.>), argument)
 import Control.Monad.Except            (ExceptT, MonadError, runExceptT, throwError)
 import Control.Monad.State             (MonadState, StateT, runStateT)
 import Control.Monad.Writer            (MonadWriter, WriterT, runWriterT, tell)
@@ -21,6 +21,7 @@ import Network.HTTP.Client             (HttpException (StatusCodeException))
 import Network.Wreq                    (defaults, param, responseBody, statusMessage)
 import Network.Wreq.Session            (Session, getWith, withAPISession)
 import Options.Applicative
+import System.Directory
 import System.Environment              (withArgs)
 import Text.PrettyPrint.Boxes          hiding ((<>))
 
@@ -166,8 +167,8 @@ getChampionName championId = use (champions . at (txt championId)) !?? getName
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
         getName = preview (key "name" . _String) <$> getData url !?? throw "Illegal json"
 
-parseApiConfig :: (MonadCatch m, MonadError AppError m, MonadIO m) => m ApiConfig
-parseApiConfig = decode <$> readFile "config.json" `catchAny` fileError !?? parseError
+parseApiConfig :: (MonadCatch m, MonadError AppError m, MonadIO m) => FilePath -> m ApiConfig
+parseApiConfig path = decode <$> readFile path `catchAny` fileError !?? parseError
   where fileError = const $ throw "Cannot find config file"
         parseError = throw "Cannot parse config file"
 
@@ -183,17 +184,21 @@ parseArgs = execParser $ info (helper <*> parser) idm
 
 runApp :: App a -> Args -> Session -> IO (Either AppError a)
 runApp (App app) (region, name, debug) session = runExceptT $ do
-  apiConfig <- parseApiConfig
+  let appName = "lolstats"
+  dir <- liftIO $ getAppUserDataDirectory appName
+  let configPath = dir </> appName <.> "config"
+      cachePath = dir </> appName <.> "cache"
+      readCache = fromMaybe emptyCache . decode
+                  <$> readFile cachePath `catchAny` const (return "")
+      writeCache cache = writeFile cachePath (encode cache)
+                         `catchAny` const (throw "Cannot write cache file")
+  apiConfig <- parseApiConfig configPath
   platform <- lookup region regionDict ??? throw ("unknown region " ++ region)
   let cfg = Config apiConfig session region platform name
   ((result, cache), log) <- runWriterT (runStateT (runReaderT app cfg) =<< readCache)
   writeCache cache
   when debug $ putStrLn (unlines log)
   return result
-  where readCache = fromMaybe emptyCache . decode
-                    <$> readFile "cache.json" `catchAny` const (return "")
-        writeCache cache = writeFile "cache.json" (encode cache)
-                           `catchAny` const (throw "Cannot write cache file (cache.json)")
 
 mainApp :: App GameInfo
 mainApp = getSummonerId >>= getCurrentGame
