@@ -66,7 +66,7 @@ instance MonadBaseControl IO App where
     where unApp (App a) = a
   restoreM = App . restoreM
 
-type GameInfo = [[(Text, Text, Text, Text)]]
+type GameInfo = [[(Text, Text, Text, Text, Text)]]
 
 regionDict :: Map Text Text
 regionDict = mapFromList [("na", "NA1"), ("euw", "EUW1"), ("eune", "EUN1"), ("kr", "KR")
@@ -124,13 +124,15 @@ getCurrentGame summonerId = do
   participants <- getParticipants <$> getData url !?? throw "Illegal json"
   let getDivisions = getSummonersDivision $ map (view _2) participants
       getChampions = mapConcurrently (getChampionName . view _4) participants
-  (divisions, champions) <- runConcurrently $ (,)
-                            <$> Concurrently getDivisions
-                            <*> Concurrently getChampions
+      getStats = mapConcurrently (\(_, sid, _, cid) -> getSummonersChampionStats sid cid) participants
+  (divisions, champions, stats) <- runConcurrently $ (,,)
+                                   <$> Concurrently getDivisions
+                                   <*> Concurrently getChampions
+                                   <*> Concurrently getStats
   updateCache participants champions
-  return $ map (map (\(c, n, d, s, _) -> (c, n, d, s)))
-         $ groupAllOn (view _5)
-         $ zipWith3 (\(n, _, t, _) (d, s) c -> (c, n, d, s, t)) participants divisions champions
+  return $ map (map (\(c, n, d, s, g, _) -> (c, g, n, d, s)))
+         $ groupAllOn (view _6)
+         $ zipWith4 (\(n, _, t, _) (d, s) c g -> (c, n, d, s, g, t)) participants divisions champions stats
   where getParticipants = mapM sequenceT . toListOf (key "participants" . values
                           . to ((,,,)
                                 <$> preview (key "summonerName" . _String)
@@ -138,6 +140,23 @@ getCurrentGame summonerId = do
                                 <*> preview (key "teamId" . _Integer)
                                 <*> preview (key "championId" . _Integer)))
         updateCache p c = champions %= (++ mapFromList (zip (map (txt . view _4) p) c))
+
+getSummonersChampionStats :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m, MonadIO m)
+                             => Integer -> Integer -> m Text
+getSummonersChampionStats summonerId championId = do
+  region <- region <$> ask
+  let url = urlRoot region ++ "api/lol/" ++ region ++ "/v1.3/stats/by-summoner/"
+            ++ txt summonerId ++ "/ranked"
+  getStats <$> getData url !?? throw "Illegal json"
+  where getStats = map (maybe "0" format . headMay . filter ((== championId) . view _1))
+                   . mapM sequenceT
+                   . toListOf (key "champions" . values
+                                . to ((,,)
+                                      <$> preview (key "id" . _Integer)
+                                      <*> preview (key "stats" . key "totalSessionsPlayed" . _Integer)
+                                      <*> preview (key "stats" . key "totalSessionsWon" . _Integer)))
+        format (_, totalPlayed, won) = "(" ++ txt (round $ realToFrac won / realToFrac totalPlayed * 100)
+                                       ++ "% of " ++ txt totalPlayed ++ ")"
 
 getSummonersDivision :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m, MonadIO m)
                         => [Integer] -> m [(Text, Text)]
