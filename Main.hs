@@ -66,7 +66,7 @@ instance MonadBaseControl IO App where
     where unApp (App a) = a
   restoreM = App . restoreM
 
-type GameInfo = [[(Text, Text, Text)]]
+type GameInfo = [[(Text, Text, Text, Text)]]
 
 regionDict :: Map Text Text
 regionDict = mapFromList [("na", "NA1"), ("euw", "EUW1"), ("eune", "EUN1"), ("kr", "KR")
@@ -124,11 +124,13 @@ getCurrentGame summonerId = do
   participants <- getParticipants <$> getData url !?? throw "Illegal json"
   let getDivisions = getSummonersDivision $ map (view _2) participants
       getChampions = mapConcurrently (getChampionName . view _4) participants
-  (divisions, champions) <- runConcurrently $ each Concurrently (getDivisions, getChampions)
+  (divisions, champions) <- runConcurrently $ (,)
+                            <$> Concurrently getDivisions
+                            <*> Concurrently getChampions
   updateCache participants champions
-  return $ map (map (\(c, n, d, _) -> (c, n, d)))
-         $ groupAllOn (view _4)
-         $ zipWith3 (\(n, _, t, _) d c -> (c, n, d, t)) participants divisions champions
+  return $ map (map (\(c, n, d, s, _) -> (c, n, d, s)))
+         $ groupAllOn (view _5)
+         $ zipWith3 (\(n, _, t, _) (d, s) c -> (c, n, d, s, t)) participants divisions champions
   where getParticipants = mapM sequenceT . toListOf (key "participants" . values
                           . to ((,,,)
                                 <$> preview (key "summonerName" . _String)
@@ -138,7 +140,7 @@ getCurrentGame summonerId = do
         updateCache p c = champions %= (++ mapFromList (zip (map (txt . view _4) p) c))
 
 getSummonersDivision :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m, MonadIO m)
-                        => [Integer] -> m [Text]
+                        => [Integer] -> m [(Text, Text)]
 getSummonersDivision summonerIds = do
   region <- region <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v2.5/league/by-summoner/"
@@ -146,7 +148,7 @@ getSummonersDivision summonerIds = do
   r <- getData url
   mapM (map getRankedSolo5x5 . getDivision r) summonerIds ??? throw "Illegal json"
   where sids = intercalate "," . map txt $ summonerIds
-        getRankedSolo5x5 = maybe "Unranked" format
+        getRankedSolo5x5 = maybe ("Unranked", "") (formatDivision &&& formatSeries)
                            . headMay . filter ((== "RANKED_SOLO_5x5") . view _1)
         getDivision json sid = mapM (sequenceT . over _5 (Just . fromMaybe ""))
                                $ json ^.. key (txt sid) . values
@@ -159,8 +161,8 @@ getSummonersDivision summonerIds = do
                                                   . key "leaguePoints" . _Integer)
                                      <*> preview (key "entries" . nth 0
                                                   . key "miniSeries" . key "progress" . _String))
-        format (_, tier, division, lps, series) = tier ++ " " ++ division
-          ++ " (" ++ (if lps == 100 then series else txt lps) ++ ")"
+        formatDivision (_, tier, division, _, _) = tier ++ " " ++ division
+        formatSeries (_, _, _, lps, series) =  "(" ++ (if lps == 100 then series else txt lps) ++ ")"
 
 getChampionName :: Integer -> App Text
 getChampionName championId = use (champions . at (txt championId)) !?? getName
