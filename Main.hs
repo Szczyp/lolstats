@@ -23,6 +23,7 @@ import Network.Wreq.Session            (Session, getWith, withAPISession)
 import Options.Applicative
 import System.Directory
 import System.Environment              (withArgs)
+import System.IO                       (hSetEncoding, utf8)
 import Text.PrettyPrint.Boxes          hiding ((<>))
 
 newtype AppError = AppError Text
@@ -214,6 +215,7 @@ printGameInfo = printBox . hsep 6 left
 
 main :: IO ()
 main = do
+  mapM (flip hSetEncoding utf8) [stdout, stderr, stdin]
   args <- parseArgs
   withAPISession (runApp mainApp args >=> either print printGameInfo)
 
