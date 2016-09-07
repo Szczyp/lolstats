@@ -163,7 +163,7 @@ getSummonersDivision summonerIds = do
                                      <*> preview (key "entries" . nth 0
                                                   . key "miniSeries" . key "progress" . _String))
         formatDivision (_, tier, division, _, _) = tier ++ " " ++ division
-        formatSeries (_, _, _, lps, series) =  "(" ++ (if lps == 100 then series else txt lps) ++ ")"
+        formatSeries (_, _, _, lps, series) =  if lps == 100 then series else txt lps
 
 getChampionName :: Integer -> App Text
 getChampionName championId = use (champions . at (txt championId)) !?? getName
@@ -211,7 +211,8 @@ printGameInfo = printBox . hsep 6 left
                 . map (hsep 2 left
                        . map (vcat left)
                        . transpose
-                       . map (^.. each . to (text . unpack)))
+                       . map (^.. each . to (text . unpack))
+                       . (++) [("CHAMPION:", "SUMMONER:", "DIVISION:", "LP:")])
 
 main :: IO ()
 main = do
