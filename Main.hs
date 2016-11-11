@@ -88,23 +88,26 @@ infix 3 ???
 (!??) a b = maybe b return =<< a
 infix 3 !??
 
+class Monad m => MonadHttp m where
+  httpGet :: Text -> m LByteString
+
+instance MonadHttp App where
+  httpGet url = do
+    Config {session = session, api = (ApiConfig aKey)} <- ask
+    let opts = defaults & param "api_key" .~ [aKey]
+    tell [url]
+    view responseBody <$> getWith opts session (unpack url) `catchHttp` handleError
+    where handleError (StatusCodeException s _ _) = errorMsg . decodeUtf8 $ s ^. statusMessage
+          handleError _ = errorMsg "Network Error"
+          errorMsg msg = msg ++ " (" ++ url ++ ")"
+          catchHttp action handler = liftIO ((Right <$> action) `catch` (return . Left . handler))
+                                  >>= either throw return
+
 urlRoot :: Text -> Text
 urlRoot region = "https://" ++ region ++ ".api.pvp.net/"
 
-getData :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m, MonadIO m)
-           => Text -> m LByteString
-getData url = do
-  Config {session = session, api = (ApiConfig aKey)} <- ask
-  let opts = defaults & param "api_key" .~ [aKey]
-  tell [url]
-  view responseBody <$> getWith opts session (unpack url) `catchHttp` handleError
-  where handleError (StatusCodeException s _ _) = errorMsg . decodeUtf8 $ s ^. statusMessage
-        handleError _ = errorMsg "Network Error"
-        errorMsg msg = msg ++ " (" ++ url ++ ")"
-        catchHttp action handler = liftIO ((Right <$> action) `catch` (return . Left . handler))
-                                >>= either throw return
-
-getSummonerId :: App Integer
+getSummonerId :: (MonadReader Config m, MonadError AppError m, MonadState Cache m, MonadHttp m)
+              => m Integer
 getSummonerId = do
   (name, region) <- (name &&& region) <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v1.4/summoner/by-name/" ++ name
@@ -112,17 +115,19 @@ getSummonerId = do
       summonerCacheKey = region ++ " | " ++ name
       getId = preview $ nameKey . key "id" . _Integer
       fromCache = use $ summoners . at summonerCacheKey
-      fromApi = getId <$> getData url !?? throw "Can't get summoner id"
+      fromApi = getId <$> httpGet url !?? throw "Can't get summoner id"
   sid <- fromCache !?? fromApi
   summoners %= insertMap summonerCacheKey sid
   return sid
 
-getCurrentGame :: Integer -> App GameInfo
+getCurrentGame :: (MonadReader Config m, MonadState Cache m, MonadError AppError m, MonadHttp m
+                  , MonadBaseControl IO m)
+               => Integer -> m GameInfo
 getCurrentGame summonerId = do
   (region, platform) <- (region &&& platform) <$> ask
   let url = urlRoot region ++ "observer-mode/rest/consumer/getSpectatorGameInfo" ++ "/"
             ++ platform ++ "/" ++ txt summonerId
-  participants <- getParticipants <$> getData url !?? throw "Illegal json"
+  participants <- getParticipants <$> httpGet url !?? throw "Illegal json"
   let getDivisions = getSummonersDivision $ map (view _2) participants
       getChampions = mapConcurrently (getChampionName . view _4) participants
   (divisions, champions) <- runConcurrently $ (,)
@@ -140,13 +145,13 @@ getCurrentGame summonerId = do
                                 <*> preview (key "championId" . _Integer)))
         updateCache p c = champions %= (++ mapFromList (zip (map (txt . view _4) p) c))
 
-getSummonersDivision :: (MonadReader Config m, MonadWriter Log m, MonadError AppError m, MonadIO m)
-                        => [Integer] -> m [(Text, Text)]
+getSummonersDivision :: (MonadReader Config m, MonadError AppError m, MonadHttp m)
+                     => [Integer] -> m [(Text, Text)]
 getSummonersDivision summonerIds = do
   region <- region <$> ask
   let url = urlRoot region ++ "api/lol/" ++ region ++ "/v2.5/league/by-summoner/"
             ++ sids ++ "/entry"
-  r <- getData url
+  r <- httpGet url
   mapM (map getRankedSolo5x5 . getDivision r) summonerIds ??? throw "Illegal json"
   where sids = intercalate "," . map txt $ summonerIds
         getRankedSolo5x5 = maybe ("Unranked", "") (formatDivision &&& formatSeries)
@@ -165,10 +170,11 @@ getSummonersDivision summonerIds = do
         formatDivision (_, tier, division, _, _) = tier ++ " " ++ division
         formatSeries (_, _, _, lps, series) =  if lps == 100 then series else txt lps
 
-getChampionName :: Integer -> App Text
+getChampionName :: (MonadState Cache m, MonadError AppError m, MonadHttp m)
+                => Integer -> m Text
 getChampionName championId = use (champions . at (txt championId)) !?? getName
   where url = urlRoot "global" ++ "api/lol/static-data/eune/v1.2/champion/" ++ txt championId
-        getName = preview (key "name" . _String) <$> getData url !?? throw "Illegal json"
+        getName = preview (key "name" . _String) <$> httpGet url !?? throw "Illegal json"
 
 parseApiConfig :: (MonadCatch m, MonadError AppError m, MonadIO m) => FilePath -> m ApiConfig
 parseApiConfig path = decode <$> readFile path `catchAny` fileError !?? parseError
@@ -216,7 +222,7 @@ printGameInfo = printBox . hsep 6 left
 
 main :: IO ()
 main = do
-  mapM (flip hSetEncoding utf8) [stdout, stderr, stdin]
+  mapM_ (flip hSetEncoding utf8) [stdout, stderr, stdin]
   args <- parseArgs
   withAPISession (runApp mainApp args >=> either print printGameInfo)
 
