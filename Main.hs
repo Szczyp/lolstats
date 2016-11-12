@@ -67,6 +67,21 @@ instance MonadBaseControl IO App where
     where unApp (App a) = a
   restoreM = App . restoreM
 
+class Monad m => MonadHttp m where
+  httpGet :: Text -> m LByteString
+
+instance MonadHttp App where
+  httpGet url = do
+    Config {session = session, api = (ApiConfig aKey)} <- ask
+    let opts = defaults & param "api_key" .~ [aKey]
+    tell [url]
+    view responseBody <$> getWith opts session (unpack url) `catchHttp` handleError
+    where handleError (StatusCodeException s _ _) = errorMsg . decodeUtf8 $ s ^. statusMessage
+          handleError _ = errorMsg "Network Error"
+          errorMsg msg = msg ++ " (" ++ url ++ ")"
+          catchHttp action handler = liftIO ((Right <$> action) `catch` (return . Left . handler))
+                                  >>= either throw return
+
 type GameInfo = [[(Text, Text, Text, Text)]]
 
 regionDict :: Map Text Text
@@ -87,21 +102,6 @@ infix 3 ???
 (!??) :: Monad m => m (Maybe b) -> m b -> m b
 (!??) a b = maybe b return =<< a
 infix 3 !??
-
-class Monad m => MonadHttp m where
-  httpGet :: Text -> m LByteString
-
-instance MonadHttp App where
-  httpGet url = do
-    Config {session = session, api = (ApiConfig aKey)} <- ask
-    let opts = defaults & param "api_key" .~ [aKey]
-    tell [url]
-    view responseBody <$> getWith opts session (unpack url) `catchHttp` handleError
-    where handleError (StatusCodeException s _ _) = errorMsg . decodeUtf8 $ s ^. statusMessage
-          handleError _ = errorMsg "Network Error"
-          errorMsg msg = msg ++ " (" ++ url ++ ")"
-          catchHttp action handler = liftIO ((Right <$> action) `catch` (return . Left . handler))
-                                  >>= either throw return
 
 urlRoot :: Text -> Text
 urlRoot region = "https://" ++ region ++ ".api.pvp.net/"
@@ -222,7 +222,7 @@ printGameInfo = printBox . hsep 6 left
 
 main :: IO ()
 main = do
-  mapM_ (flip hSetEncoding utf8) [stdout, stderr, stdin]
+  mapM_ (`hSetEncoding` utf8) [stdout, stderr, stdin]
   args <- parseArgs
   withAPISession (runApp mainApp args >=> either print printGameInfo)
 
